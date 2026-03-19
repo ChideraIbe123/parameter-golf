@@ -62,15 +62,16 @@ class Hyperparameters:
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 1))
-    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
-    model_dim = int(os.environ.get("MODEL_DIM", 512))
-    num_heads = int(os.environ.get("NUM_HEADS", 8))
+    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 6))
+    model_dim = int(os.environ.get("MODEL_DIM", 768))
+    num_heads = int(os.environ.get("NUM_HEADS", 12))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
-    num_loops = int(os.environ.get("NUM_LOOPS", 4))
-    lora_rank = int(os.environ.get("LORA_RANK", 8))
+    num_blocks = int(os.environ.get("NUM_BLOCKS", 3))
+    num_loops = int(os.environ.get("NUM_LOOPS", 3))
+    lora_rank = int(os.environ.get("LORA_RANK", 4))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -729,6 +730,7 @@ class GPT(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         mlp_mult: int,
+        num_blocks: int,
         num_loops: int,
         lora_rank: int,
         tie_embeddings: bool,
@@ -743,15 +745,23 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.num_blocks = num_blocks
         self.num_loops = num_loops
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         head_dim = model_dim // num_heads
-        # Single shared transformer block
-        self.block = Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base)
-        # Per-loop LoRA deltas for diversity across loops
-        self.lora_bank = LoRABank(model_dim, num_kv_heads, head_dim, mlp_mult, num_loops, lora_rank)
-        # Per-loop scalar controls
-        self.loop_scalars = LoopScalars(model_dim, num_heads, num_loops, qk_gain_init)
+        # Multiple shared transformer blocks, each looped num_loops times
+        self.blocks = nn.ModuleList([
+            Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base)
+            for _ in range(num_blocks)
+        ])
+        # Per-block, per-loop LoRA deltas for diversity
+        self.lora_banks = nn.ModuleList([
+            LoRABank(model_dim, num_kv_heads, head_dim, mlp_mult, num_loops, lora_rank)
+            for _ in range(num_blocks)
+        ])
+        # Per-block, per-loop scalar controls
+        total_effective_layers = num_blocks * num_loops
+        self.loop_scalars = LoopScalars(model_dim, num_heads, total_effective_layers, qk_gain_init)
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -770,17 +780,20 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
 
-        # Recursive: loop shared block N times with per-loop LoRA deltas and scalars
-        for loop_idx in range(self.num_loops):
-            x = self.block(
-                x, x0,
-                lora_bank=self.lora_bank,
-                loop_idx=loop_idx,
-                attn_scale=self.loop_scalars.attn_scales[loop_idx],
-                mlp_scale=self.loop_scalars.mlp_scales[loop_idx],
-                resid_mix=self.loop_scalars.resid_mixes[loop_idx],
-                q_gain=self.loop_scalars.q_gains[loop_idx],
-            )
+        # Each shared block is looped num_loops times with per-loop LoRA deltas
+        scalar_idx = 0
+        for block_idx in range(self.num_blocks):
+            for loop_idx in range(self.num_loops):
+                x = self.blocks[block_idx](
+                    x, x0,
+                    lora_bank=self.lora_banks[block_idx],
+                    loop_idx=loop_idx,
+                    attn_scale=self.loop_scalars.attn_scales[scalar_idx],
+                    mlp_scale=self.loop_scalars.mlp_scales[scalar_idx],
+                    resid_mix=self.loop_scalars.resid_mixes[scalar_idx],
+                    q_gain=self.loop_scalars.q_gains[scalar_idx],
+                )
+                scalar_idx += 1
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -899,6 +912,7 @@ def main() -> None:
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
         mlp_mult=args.mlp_mult,
+        num_blocks=args.num_blocks,
         num_loops=args.num_loops,
         lora_rank=args.lora_rank,
         tie_embeddings=args.tie_embeddings,
@@ -911,7 +925,8 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     # LoRA and LoopScalars params are small — keep in fp32 for optimizer quality
-    base_model.lora_bank.float()
+    for lb in base_model.lora_banks:
+        lb.float()
     base_model.loop_scalars.float()
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
@@ -923,18 +938,17 @@ def main() -> None:
     # - shared block matrix params use MATRIX_LR via Muon
     # - LoRA A/B params (small 2D) use LORA_LR via Adam
     # - loop scalars + other vectors use SCALAR_LR via Adam
-    block_named_params = list(base_model.block.named_parameters())
-    matrix_params = [
-        p
-        for name, p in block_named_params
-        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-    ]
-    block_scalar_params = [
-        p
-        for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-    ]
-    lora_params = list(base_model.lora_bank.parameters())
+    matrix_params = []
+    block_scalar_params = []
+    for block in base_model.blocks:
+        for name, p in block.named_parameters():
+            if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS):
+                matrix_params.append(p)
+            else:
+                block_scalar_params.append(p)
+    lora_params = []
+    for lb in base_model.lora_banks:
+        lora_params.extend(lb.parameters())
     loop_scalar_params = list(base_model.loop_scalars.parameters())
     all_scalar_params = block_scalar_params + loop_scalar_params
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
@@ -978,7 +992,7 @@ def main() -> None:
     n_lora_params = sum(p.numel() for p in lora_params)
     n_loop_scalar_params = sum(p.numel() for p in loop_scalar_params)
     log0(f"model_params:{n_params} (lora:{n_lora_params} loop_scalars:{n_loop_scalar_params})")
-    log0(f"architecture:recursive num_loops:{args.num_loops} lora_rank:{args.lora_rank}")
+    log0(f"architecture:recursive num_blocks:{args.num_blocks} num_loops:{args.num_loops} effective_layers:{args.num_blocks * args.num_loops} lora_rank:{args.lora_rank}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
