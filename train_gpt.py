@@ -78,7 +78,7 @@ class Hyperparameters:
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
-    matrix_lr = float(os.environ.get("MATRIX_LR", 0.02))
+    matrix_lr = float(os.environ.get("MATRIX_LR", 0.013))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
@@ -663,9 +663,9 @@ class LoRABank(nn.Module):
             setattr(self, f"A_{tname}", nn.Parameter(
                 torch.randn(num_loops, in_dim, rank) * (1.0 / math.sqrt(in_dim))
             ))
-            # B: (num_loops, rank, out_dim) — small random init so loops differentiate immediately
+            # B: (num_loops, rank, out_dim) — zero init (paper-recommended, stable)
             setattr(self, f"B_{tname}", nn.Parameter(
-                torch.randn(num_loops, rank, out_dim) * (0.01 / math.sqrt(rank))
+                torch.zeros(num_loops, rank, out_dim)
             ))
 
     def get_delta(self, target_name: str, loop_idx: int, x: Tensor) -> Tensor:
