@@ -1173,11 +1173,6 @@ def main() -> None:
             break
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
-        # Enable QAT after 20% of training time
-        global _qat_enabled
-        if not _qat_enabled and max_wallclock_ms and elapsed_ms > 0.2 * max_wallclock_ms:
-            _qat_enabled = True
-            log0(f"qat:enabled step:{step} elapsed:{elapsed_ms:.0f}ms")
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
