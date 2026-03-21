@@ -869,7 +869,15 @@ class GPT(nn.Module):
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+        # Entropy-weighted loss: upweight hard tokens, downweight easy ones
+        per_token_loss = F.cross_entropy(logits.float(), targets, reduction="none")
+        with torch.no_grad():
+            probs = F.softmax(logits.float(), dim=-1)
+            entropy = -(probs * (probs + 1e-8).log()).sum(dim=-1)
+            # Normalize entropy to [0.5, 1.5] range so easy tokens get 0.5x, hard get 1.5x
+            entropy_weight = 0.5 + entropy / (entropy.mean() + 1e-8)
+            entropy_weight = entropy_weight.clamp(0.5, 1.5)
+        return (per_token_loss * entropy_weight).mean()
 
 
 # -----------------------------
