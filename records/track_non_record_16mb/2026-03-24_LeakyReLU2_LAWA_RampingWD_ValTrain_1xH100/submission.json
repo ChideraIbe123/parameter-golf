@@ -1,0 +1,15 @@
+{
+  "author": "Chidera Ibe",
+  "github_id": "ChideraIbe123",
+  "name": "LeakyReLU² + LAWA + Ramping WD + Val Training",
+  "blurb": "10-layer baseline with LeakyReLU(0.5)² activation, lzma compression, LAWA checkpoint averaging, ramping weight decay (0.02→0.08), and validation set training. Explored recursive transformers, differential attention (ICLR 2025), VRL (ACL 2025), entropy-weighted loss, and QAT — documented negative results. Run on 1xH100 SXM (non-record).",
+  "date": "2026-03-24T00:00:00Z",
+  "val_loss": 2.07708453,
+  "val_bpb": 1.23016646,
+  "val_bpb_post_quant": 1.2302,
+  "bytes_total": 13472418,
+  "bytes_code": 62510,
+  "hardware": "1xH100 SXM (Spot, RunPod)",
+  "steps": 1399,
+  "step_avg_ms": 429
+}
