@@ -790,10 +790,14 @@ class CausalSelfAttention(nn.Module):
         lam = (torch.exp(torch.dot(self.lambda_q1.float(), self.lambda_k1.float()))
                - torch.exp(torch.dot(self.lambda_q2.float(), self.lambda_k2.float()))
                + self.lambda_init)
+        # Split V into halves to match Q/K half-head dim for SDPA
+        v1, v2 = v[..., :self.half_head], v[..., self.half_head:]
         # Use Flash Attention for both halves (fast!), then subtract outputs
-        y1 = F.scaled_dot_product_attention(q1, k1, v, attn_mask=None, is_causal=True)
-        y2 = F.scaled_dot_product_attention(q2, k2, v, attn_mask=None, is_causal=True)
-        y = y1 - lam.to(dtype=y1.dtype) * y2
+        y1 = F.scaled_dot_product_attention(q1, k1, v1, attn_mask=None, is_causal=True)
+        y2 = F.scaled_dot_product_attention(q2, k2, v2, attn_mask=None, is_causal=True)
+        # Differential: subtract and concatenate halves back
+        y = torch.cat([y1 - lam.to(dtype=y1.dtype) * y2,
+                       y1 + lam.to(dtype=y1.dtype) * y2], dim=-1)
         # Normalize and scale per paper
         y = self.diff_norm(y) * (1.0 - self.lambda_init)
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
