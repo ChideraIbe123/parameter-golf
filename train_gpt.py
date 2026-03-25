@@ -743,11 +743,14 @@ class CausalSelfAttention(nn.Module):
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, v0: Tensor | None = None) -> tuple[Tensor, Tensor]:
         bsz, seqlen, dim = x.shape
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        # VRL: blend current V with layer 0's V (arXiv:2410.17897)
+        if v0 is not None:
+            v = 0.5 * v + 0.5 * v0
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
@@ -763,7 +766,7 @@ class CausalSelfAttention(nn.Module):
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
-        return self.proj(y)
+        return self.proj(y), v.detach()
 
 
 class MLP(nn.Module):
@@ -799,13 +802,13 @@ class Block(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
+    def forward(self, x: Tensor, x0: Tensor, v0: Tensor | None = None) -> tuple[Tensor, Tensor]:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
+        attn_out, v_out = self.attn(self.attn_norm(x), v0=v0)
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
-        return x
+        return x, v_out
 
 
 class GPT(nn.Module):
@@ -867,13 +870,17 @@ class GPT(nn.Module):
         skips: list[Tensor] = []
 
         # First half stores skips; second half reuses them in reverse order.
+        # VRL: layer 0 saves its V, all subsequent layers blend it in
+        v0 = None
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            x, v_out = self.blocks[i](x, x0, v0=v0)
+            if i == 0:
+                v0 = v_out  # capture layer 0's V for VRL
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            x, _ = self.blocks[self.num_encoder_layers + i](x, x0, v0=v0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -1346,13 +1353,16 @@ def main() -> None:
                     xemb = F.rms_norm(xemb, (xemb.size(-1),))
                     x0 = xemb
                     skips_eval: list[Tensor] = []
+                    v0_eval = None
                     for i in range(base_model.num_encoder_layers):
-                        xemb = base_model.blocks[i](xemb, x0)
+                        xemb, v_out_eval = base_model.blocks[i](xemb, x0, v0=v0_eval)
+                        if i == 0:
+                            v0_eval = v_out_eval
                         skips_eval.append(xemb)
                     for i in range(base_model.num_decoder_layers):
                         if skips_eval:
                             xemb = xemb + base_model.skip_weights[i].to(dtype=xemb.dtype)[None, None, :] * skips_eval.pop()
-                        xemb = base_model.blocks[base_model.num_encoder_layers + i](xemb, x0)
+                        xemb, _ = base_model.blocks[base_model.num_encoder_layers + i](xemb, x0, v0=v0_eval)
                     xemb = base_model.final_norm(xemb)
                     logits_proj = F.linear(xemb, base_model.tok_emb.weight) if base_model.tie_embeddings else base_model.lm_head(xemb)
                     logits = base_model.logit_softcap * torch.tanh(logits_proj / base_model.logit_softcap)
