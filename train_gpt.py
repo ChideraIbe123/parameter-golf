@@ -664,6 +664,10 @@ def _fake_quantize_int8(w: Tensor) -> Tensor:
 # Global flag toggled by training loop
 _qat_enabled = False
 
+# ProRes: global training step counter (arXiv:2603.05369, March 2026)
+_prores_step = 0
+_prores_total_steps = 1500  # total expected steps, set in main()
+
 
 class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
@@ -742,16 +746,10 @@ class CausalSelfAttention(nn.Module):
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
-        # Gated Attention: per-head sigmoid gate from query (NeurIPS 2025, arXiv:2505.06708)
-        self.attn_gate = CastedLinear(dim, num_heads, bias=False)
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
-        q = self.c_q(x)
-        # Compute per-head gate from query before reshape
-        gate = torch.sigmoid(self.attn_gate(x))  # (bsz, seqlen, num_heads)
-        gate = gate.transpose(1, 2).unsqueeze(-1)  # (bsz, num_heads, seqlen, 1)
-        q = q.reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
+        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         q = F.rms_norm(q, (q.size(-1),))
@@ -768,8 +766,6 @@ class CausalSelfAttention(nn.Module):
             is_causal=True,
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
-        # Apply gated attention: heads can turn off for uninformative tokens
-        y = y * gate.to(dtype=y.dtype)
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
@@ -797,8 +793,10 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        layer_idx: int = 0,
     ):
         super().__init__()
+        self.layer_idx = layer_idx
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
@@ -810,9 +808,14 @@ class Block(nn.Module):
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        # ProRes: deeper layers warm up slower (arXiv:2603.05369)
+        prores_scale = 1.0
+        if self.training and _prores_total_steps > 0:
+            warmup_steps = 100 + self.layer_idx * 80  # layer 0: 100 steps, layer 9: 820 steps
+            prores_scale = min(1.0, _prores_step / max(warmup_steps, 1))
         attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out * prores_scale
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x)) * prores_scale
         return x
 
 
@@ -851,6 +854,7 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    layer_idx=i,
                 )
                 for i in range(num_layers)
             ]
@@ -1220,6 +1224,8 @@ def main() -> None:
         zero_grad_all()
 
         step += 1
+        global _prores_step
+        _prores_step = step
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
 
         # LAWA: collect checkpoints from last 20% of training for weight averaging
