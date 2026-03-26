@@ -742,10 +742,16 @@ class CausalSelfAttention(nn.Module):
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
+        # Gated Attention: per-head sigmoid gate from query (NeurIPS 2025, arXiv:2505.06708)
+        self.attn_gate = CastedLinear(dim, num_heads, bias=False)
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
-        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
+        q = self.c_q(x)
+        # Compute per-head gate from query before reshape
+        gate = torch.sigmoid(self.attn_gate(x))  # (bsz, seqlen, num_heads)
+        gate = gate.transpose(1, 2).unsqueeze(-1)  # (bsz, num_heads, seqlen, 1)
+        q = q.reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         q = F.rms_norm(q, (q.size(-1),))
@@ -762,6 +768,8 @@ class CausalSelfAttention(nn.Module):
             is_causal=True,
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
+        # Apply gated attention: heads can turn off for uninformative tokens
+        y = y * gate.to(dtype=y.dtype)
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
