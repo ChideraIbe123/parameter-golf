@@ -796,7 +796,7 @@ class Block(nn.Module):
         self.attn_norm = RMSNorm()
         # ProRes: warmup schedule for this layer (arXiv:2603.05369)
         self.register_buffer("_prores_step", torch.zeros(1), persistent=False)
-        self._prores_warmup = 100.0 + layer_idx * 80.0  # layer 0: 100, layer 9: 820
+        self._prores_warmup = 30.0 + layer_idx * 30.0  # layer 0: 30 steps, layer 9: 300 steps
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
