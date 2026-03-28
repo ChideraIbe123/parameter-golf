@@ -811,12 +811,12 @@ class Block(nn.Module):
 
     def _delta_transform(self, x: Tensor) -> Tensor:
         """DDL: apply (I - β·k·kᵀ) to x — can erase redundant directions."""
-        # k: unit direction to reflect/erase, β: how much to erase
-        k = F.normalize(self.delta_proj(x.mean(dim=1)), dim=-1)  # (b, dim)
-        beta = torch.sigmoid(self.delta_gate(x.mean(dim=1)))  # (b, 1)
+        # Per-token k and beta (no mean pooling — keeps shapes compatible)
+        k = F.normalize(self.delta_proj(x), dim=-1)  # (b, seq, dim)
+        beta = torch.sigmoid(self.delta_gate(x))  # (b, seq, 1)
         # x - β * (x · k) * k  (rank-1 perturbation of identity)
-        proj = (x * k.unsqueeze(1)).sum(dim=-1, keepdim=True)  # (b, seq, 1)
-        return x - beta.unsqueeze(1) * proj * k.unsqueeze(1)
+        proj = (x * k).sum(dim=-1, keepdim=True)  # (b, seq, 1)
+        return x - beta * proj * k
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
