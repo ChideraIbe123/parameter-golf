@@ -93,6 +93,7 @@ class Hyperparameters:
     slot_steps = int(os.environ.get("SLOT_STEPS", 16))
     slot_lr = float(os.environ.get("SLOT_LR", 0.008))
     slot_lr_min = float(os.environ.get("SLOT_LR_MIN", 0.0008))
+    slot_optimizer = os.environ.get("SLOT_OPTIMIZER", "sgd")  # "sgd" or "adamw"
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
     a, b, c = (3.4445, -4.7750, 2.0315)
     X = G.bfloat16()
@@ -874,8 +875,11 @@ def eval_val_sliding_slot(
         valid_count = mask.sum()
         delta = torch.zeros(bsz, 1, hidden_f.size(-1), device=device, dtype=torch.float32, requires_grad=True)
         logit_bias = torch.zeros(bsz, 1, proj_w.size(0), device=device, dtype=torch.float32, requires_grad=True)
-        # SGD+momentum for SLOT (inspired by PR #995: SGD beats AdamW for TTT)
-        slot_opt = torch.optim.SGD([delta, logit_bias], lr=slot_lr, momentum=0.9)
+        # Configurable SLOT optimizer: SGD+momentum (novel) or AdamW (baseline)
+        if args.slot_optimizer == "sgd":
+            slot_opt = torch.optim.SGD([delta, logit_bias], lr=slot_lr, momentum=0.9)
+        else:
+            slot_opt = torch.optim.AdamW([delta, logit_bias], lr=slot_lr)
         targets_flat = y_batch.reshape(-1)
         for _step in range(slot_steps):
             _lr = slot_lr_min + 0.5 * (slot_lr - slot_lr_min) * (1 + math.cos(math.pi * _step / slot_steps))
