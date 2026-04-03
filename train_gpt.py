@@ -336,14 +336,11 @@ class RMSNorm(nn.Module):
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
 
-class DyT(nn.Module):
-    """Dynamic Tanh: drop-in normalization replacement (arXiv:2503.10622, March 2026).
-    Replaces RMSNorm with tanh(α·x) — learned α per layer, zero overhead."""
-    def __init__(self, dim: int = 0, alpha_init: float = 0.5):
+class DyT(nn.Module):  # Dynamic Tanh (arXiv:2503.10622) — drop-in RMSNorm replacement
+    def __init__(self, dim: int = 0, a: float = 0.5):
         super().__init__()
-        self.alpha = nn.Parameter(torch.tensor(alpha_init))
-    def forward(self, x: Tensor) -> Tensor:
-        return torch.tanh(self.alpha * x)
+        self.alpha = nn.Parameter(torch.tensor(a))
+    def forward(self, x: Tensor) -> Tensor: return torch.tanh(self.alpha * x)
 class CastedLinear(nn.Linear):
     _qat_enabled: bool = False
     def forward(self, x: Tensor) -> Tensor:
