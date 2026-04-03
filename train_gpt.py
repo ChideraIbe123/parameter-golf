@@ -540,8 +540,8 @@ class Block(nn.Module):
         dtg: bool = False,
     ):
         super().__init__()
-        self.attn_norm = DyT(dim)  # DyT replaces RMSNorm (arXiv:2503.10622)
-        self.mlp_norm = DyT(dim)
+        self.attn_norm = RMSNorm()
+        self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -874,7 +874,8 @@ def eval_val_sliding_slot(
         valid_count = mask.sum()
         delta = torch.zeros(bsz, 1, hidden_f.size(-1), device=device, dtype=torch.float32, requires_grad=True)
         logit_bias = torch.zeros(bsz, 1, proj_w.size(0), device=device, dtype=torch.float32, requires_grad=True)
-        slot_opt = torch.optim.AdamW([delta, logit_bias], lr=slot_lr)
+        # SGD+momentum for SLOT (inspired by PR #995: SGD beats AdamW for TTT)
+        slot_opt = torch.optim.SGD([delta, logit_bias], lr=slot_lr, momentum=0.9)
         targets_flat = y_batch.reshape(-1)
         for _step in range(slot_steps):
             _lr = slot_lr_min + 0.5 * (slot_lr - slot_lr_min) * (1 + math.cos(math.pi * _step / slot_steps))
