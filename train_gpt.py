@@ -95,7 +95,7 @@ class Hyperparameters:
  ve_layers = os.environ.get("VE_LAYERS", "9,10")
  vrl_enabled = bool(int(os.environ.get("VRL_ENABLED", "1")))
  slot_enabled = bool(int(os.environ.get("SLOT_ENABLED", "1")))
- slot_steps = int(os.environ.get("SLOT_STEPS", 8))
+ slot_steps = int(os.environ.get("SLOT_STEPS", 10))
  slot_lr = float(os.environ.get("SLOT_LR", 0.012))
  slot_lr_min = float(os.environ.get("SLOT_LR_MIN", 0.001))
  slot_batch_seqs = int(os.environ.get("SLOT_BATCH_SEQS", 32))
@@ -850,6 +850,8 @@ def eval_val_slot(
  token_count = torch.zeros((), device=device, dtype=torch.float64)
  byte_sum = torch.zeros((), device=device, dtype=torch.float64)
  base_model.eval()
+ warm_delta = None  # Warm-start: use previous batch's delta as initialization
+ warm_bias = None
  for bi in range(0, len(my_ws), args.slot_batch_seqs):
   bws = my_ws[bi:bi + args.slot_batch_seqs]
   bsz = len(bws)
@@ -875,12 +877,16 @@ def eval_val_slot(
   valid_count = mask.sum()
   if valid_count == 0:
    continue
-  # L-BFGS SLOT: second-order optimization for per-sample delta (novel)
-  # Only 1536 params — L-BFGS is provably optimal for small-scale problems
-  delta = torch.zeros(bsz, 1, hidden_f.size(-1), device=device, dtype=torch.float32, requires_grad=True)
-  logit_bias = torch.zeros(bsz, 1, proj_w.size(0), device=device, dtype=torch.float32, requires_grad=True)
+  # L-BFGS SLOT with warm-start: second-order + init from previous batch
+  hdim = hidden_f.size(-1)
+  if warm_delta is not None and warm_delta.size(0) == bsz:
+   delta = warm_delta.clone().requires_grad_(True)
+   logit_bias = warm_bias.clone().requires_grad_(True)
+  else:
+   delta = torch.zeros(bsz, 1, hdim, device=device, dtype=torch.float32, requires_grad=True)
+   logit_bias = torch.zeros(bsz, 1, proj_w.size(0), device=device, dtype=torch.float32, requires_grad=True)
   targets_flat = yb.reshape(-1)
-  slot_opt = torch.optim.LBFGS([delta, logit_bias], lr=0.1, max_iter=5, history_size=10, line_search_fn="strong_wolfe")
+  slot_opt = torch.optim.LBFGS([delta, logit_bias], lr=0.08, max_iter=4, history_size=10, line_search_fn="strong_wolfe")
   def closure():
    slot_opt.zero_grad()
    h = hidden_f + delta
@@ -892,6 +898,8 @@ def eval_val_slot(
    return loss
   for step_i in range(args.slot_steps):
    slot_opt.step(closure)
+  warm_delta = delta.detach()
+  warm_bias = logit_bias.detach()
   with torch.no_grad():
    h = hidden_f + delta.detach()
    lp = F.linear(h, proj_w) + logit_bias.detach()
