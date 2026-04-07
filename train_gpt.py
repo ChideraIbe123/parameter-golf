@@ -827,6 +827,55 @@ def eval_val_sliding(
  tokens_per_byte = token_count.item() / byte_count.item()
  base_model.train()
  return val_loss, bits_per_token * tokens_per_byte
+class NgramMixer:
+ P = [36313, 27191, 51647, 81929, 131071, 174763, 233017, 282527, 357347, 451439]
+ def __init__(s, V, dev, B=1<<22, maxN=12, minC=2, minT=5000):
+  s.V,s.B,s.M,s.maxN,s.minC,s.minT,s.dev = V,B,B-1,maxN,minC,minT,dev
+  s.seen=0; s.uni=torch.zeros(V,device=dev); s.ut=0.0
+  s.ctx=[torch.zeros(B,device=dev) for _ in range(maxN-1)]
+  s.full=[torch.zeros(B,device=dev) for _ in range(maxN-1)]
+ def _bk(s,h): return h & s.M
+ def update(s, t):
+  t=t.to(s.dev).long(); n=t.numel(); s.seen+=n
+  ones=torch.ones(n,device=s.dev)
+  s.uni.scatter_add_(0,t,ones); s.ut+=n
+  for o in range(2,s.maxN+1):
+   if n<o: continue
+   oi=o-2; nxt=t[o-1:]
+   ch=t[0:n-o+1]*s.P[0]
+   for k in range(1,o-1): ch=ch^(t[k:n-o+1+k]*s.P[k%len(s.P)])
+   ck=s._bk(ch); fh=ch^(nxt*s.P[(o-1)%len(s.P)]); fk=s._bk(fh)
+   s.ctx[oi].scatter_add_(0,ck,ones[:n-o+1])
+   s.full[oi].scatter_add_(0,fk,ones[:n-o+1])
+ def score(s, lg, xb, yb, starts, lens):
+  bsz,slen,V=lg.shape
+  lp=F.log_softmax(lg.float(),dim=-1)
+  np_=lp.gather(-1,yb.unsqueeze(-1)).squeeze(-1).exp()
+  nll=-np_.clamp(min=1e-12).log()
+  st=torch.as_tensor(starts,device=s.dev,dtype=torch.int64).view(-1,1)
+  et=torch.as_tensor(lens,device=s.dev,dtype=torch.int64).view(-1,1)
+  pos=torch.arange(slen,device=s.dev,dtype=torch.int64).view(1,-1)
+  am=(pos>=st)&(pos<et)
+  if s.seen<s.minT or not bool(am.any()): return nll
+  ar,ac=torch.where(am); npa=np_[ar,ac]
+  gp=(s.uni[yb[ar,ac]]+0.5)/(s.ut+0.5*V) if s.ut>0 else torch.full((ar.numel(),),1.0/V,device=s.dev)
+  gh=torch.zeros(ar.numel(),device=s.dev,dtype=torch.bool)
+  for o in range(s.maxN,1,-1):
+   oi=o-2; cw=o-1; el=(ac>=(cw-1))&(~gh)
+   if not bool(el.any()): continue
+   r,c=ar[el],ac[el]
+   ch=xb[r,c-(cw-1)]*s.P[0]
+   for k in range(1,cw): ch=ch^(xb[r,c-(cw-1)+k]*s.P[k%len(s.P)])
+   ck=s._bk(ch); fh=ch^(yb[r,c]*s.P[(o-1)%len(s.P)]); fk=s._bk(fh)
+   cc=s.ctx[oi][ck]; fc=s.full[oi][fk]; v=cc>=s.minC
+   if bool(v.any()):
+    ei=torch.where(el)[0]; d=ei[v]
+    gp[d]=(fc[v].clamp(max=cc[v])/cc[v].clamp(min=1)).clamp(0,1); gh[d]=True
+  pr=lp.exp(); ent=-(pr[ar,ac]*lp[ar,ac]).sum(dim=-1)
+  al=0.20+0.55*torch.sigmoid(2.0*(ent-2.5))
+  mp=(1.0-al)*npa+al*gp; out=nll.clone()
+  out[ar,ac]=-mp.clamp(min=1e-12).log(); return out
+
 def eval_val_slot(
  args: Hyperparameters,
  base_model: nn.Module,
@@ -846,18 +895,10 @@ def eval_val_slot(
   proj_w = base_model.lm_head.weight.detach().float()
  softcap = base_model.logit_softcap
  compiled_hidden = torch.compile(base_model.forward_hidden, dynamic=False, fullgraph=False)
- loss_sum = 0.0
- token_count = 0.0
- byte_sum = 0.0
- ngram_table: dict[int, dict[int, int]] = {}
- NGRAM_ORDER = 12
- NGRAM_BUCKETS = 1 << 22  # 4M hash buckets
- def _ngram_hash(toks: list[int], n: int, end: int) -> int:
-  h = 0
-  for i in range(end - n, end):
-   h = ((h * 1000003) ^ toks[i]) & (NGRAM_BUCKETS - 1)
-  return h
- val_tok_list = val_tokens.tolist()
+ loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+ token_count = torch.zeros((), device=device, dtype=torch.float64)
+ byte_sum = torch.zeros((), device=device, dtype=torch.float64)
+ ngm = NgramMixer(args.vocab_size, device)
  base_model.eval()
  for bi in range(0, len(my_ws), args.slot_batch_seqs):
   bws = my_ws[bi:bi + args.slot_batch_seqs]
@@ -884,93 +925,47 @@ def eval_val_slot(
   valid_count = mask.sum()
   if valid_count == 0:
    continue
-  # Scored-positions-only L-BFGS (saves ~50% compute per step)
-  scored_slices = []
-  for i, ws in enumerate(bws):
-   wlen = wlens[i]
-   s = 0 if ws == 0 else max(wlen - stride, 0)
-   scored_slices.append((s, wlen))
-  scored_h_list = [hidden_f[i, s:e] for i, (s, e) in enumerate(scored_slices)]
-  scored_y_list = [yb[i, s:e] for i, (s, e) in enumerate(scored_slices)]
-  scored_counts = [e - s for s, e in scored_slices]
-  max_sc = max(scored_counts)
-  sc_h = torch.zeros(bsz, max_sc, hidden_f.size(-1), device=device, dtype=torch.float32)
-  sc_y = torch.zeros(bsz, max_sc, device=device, dtype=torch.int64)
-  sc_mask = torch.zeros(bsz, max_sc, device=device)
-  for i in range(bsz):
-   sc = scored_counts[i]
-   sc_h[i, :sc] = scored_h_list[i]
-   sc_y[i, :sc] = scored_y_list[i]
-   sc_mask[i, :sc] = 1.0
-  sc_valid = sc_mask.sum()
-  sc_y_flat = sc_y.reshape(-1)
+  # L-BFGS SLOT: second-order optimization for per-sample delta (novel)
+  # Only 1536 params — L-BFGS is provably optimal for small-scale problems
   delta = torch.zeros(bsz, 1, hidden_f.size(-1), device=device, dtype=torch.float32, requires_grad=True)
   logit_bias = torch.zeros(bsz, 1, proj_w.size(0), device=device, dtype=torch.float32, requires_grad=True)
+  targets_flat = yb.reshape(-1)
   slot_opt = torch.optim.LBFGS([delta, logit_bias], lr=0.1, max_iter=5, history_size=10, line_search_fn="strong_wolfe")
   def closure():
    slot_opt.zero_grad()
-   h = sc_h + delta
+   h = hidden_f + delta
    lp = F.linear(h, proj_w) + logit_bias
    lg = softcap * torch.tanh(lp / softcap)
-   nll = F.cross_entropy(lg.reshape(-1, lg.size(-1)), sc_y_flat, reduction="none").reshape(bsz, max_sc)
-   loss = (nll * sc_mask).sum() / sc_valid
+   nll = F.cross_entropy(lg.reshape(-1, lg.size(-1)), targets_flat, reduction="none").reshape(bsz, seq_s)
+   loss = (nll * mask).sum() / valid_count
    loss.backward()
    return loss
   for step_i in range(args.slot_steps):
    slot_opt.step(closure)
   with torch.no_grad():
-   h = sc_h + delta.detach()
+   h = hidden_f + delta.detach()
    lp = F.linear(h, proj_w) + logit_bias.detach()
    lg = softcap * torch.tanh(lp / softcap)
-   log_probs = F.log_softmax(lg.float(), dim=-1)
+   starts = [0 if ws == 0 else max(wlens[i] - stride, 0) for i, ws in enumerate(bws)]
+   nll = ngm.score(lg, xb, yb, starts, wlens)
    for i, ws in enumerate(bws):
-    sc = scored_counts[i]
-    s_abs = scored_slices[i][0]
-    for pos in range(sc):
-     tgt = sc_y[i, pos].item()
-     model_lp = log_probs[i, pos, tgt].item()
-     token_pos = ws + s_abs + pos
-     # N-gram backoff lookup (order 12→2)
-     ngram_lp = None
-     for n in range(min(NGRAM_ORDER, token_pos + 1), 1, -1):
-      hk = _ngram_hash(val_tok_list, n, token_pos + 1)
-      counts = ngram_table.get(hk)
-      if counts and sum(counts.values()) >= 2:
-       prob = counts.get(tgt, 0) / sum(counts.values())
-       if prob > 0:
-        ngram_lp = math.log(prob)
-        break
-     if ngram_lp is not None:
-      ent = min(-model_lp, 10.0)
-      alpha = 0.15 + 0.45 * (1.0 / (1.0 + math.exp(-2.0 * (ent - 2.5))))
-      mixed = math.log(math.exp(model_lp) * (1 - alpha) + math.exp(ngram_lp) * alpha)
-      final_lp = max(mixed, model_lp)
-     else:
-      final_lp = model_lp
-     loss_sum += -final_lp
-     token_count += 1.0
-     prev_tok = xb[i, s_abs + pos].item()
-     tb_val = float(base_bytes_lut[tgt].item())
-     if has_leading_space_lut[tgt].item() and not is_boundary_token_lut[prev_tok].item():
-      tb_val += 1.0
-     byte_sum += tb_val
-     # Update n-gram table
-     for n in range(2, NGRAM_ORDER + 1):
-      if token_pos >= n - 1:
-       hk2 = _ngram_hash(val_tok_list, n, token_pos + 1)
-       if hk2 not in ngram_table: ngram_table[hk2] = {}
-       ngram_table[hk2][tgt] = ngram_table[hk2].get(tgt, 0) + 1
+    wlen = wlens[i]; s = starts[i]
+    loss_sum += nll[i, s:wlen].sum().to(torch.float64)
+    token_count += float(wlen - s)
+    prev_ids = xb[i, s:wlen]; tgt_ids = yb[i, s:wlen]
+    tb = base_bytes_lut[tgt_ids].to(torch.float64)
+    tb += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(torch.float64)
+    byte_sum += tb.sum()
+   for i, ws in enumerate(bws):
+    wlen = wlens[i]
+    ngm.update(yb[i, :wlen])
  if dist.is_available() and dist.is_initialized():
-  ls_t = torch.tensor(loss_sum, device=device, dtype=torch.float64)
-  tc_t = torch.tensor(token_count, device=device, dtype=torch.float64)
-  bs_t = torch.tensor(byte_sum, device=device, dtype=torch.float64)
-  dist.all_reduce(ls_t, op=dist.ReduceOp.SUM)
-  dist.all_reduce(tc_t, op=dist.ReduceOp.SUM)
-  dist.all_reduce(bs_t, op=dist.ReduceOp.SUM)
-  loss_sum, token_count, byte_sum = ls_t.item(), tc_t.item(), bs_t.item()
- val_loss = loss_sum / token_count
+  dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+  dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
+  dist.all_reduce(byte_sum, op=dist.ReduceOp.SUM)
+ val_loss = (loss_sum / token_count).item()
  bits_per_token = val_loss / math.log(2.0)
- tokens_per_byte = token_count / byte_sum
+ tokens_per_byte = token_count.item() / byte_sum.item()
  base_model.train()
  return val_loss, bits_per_token * tokens_per_byte
 def _classify_param(name: str) -> str:
