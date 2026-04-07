@@ -850,8 +850,6 @@ def eval_val_slot(
  token_count = torch.zeros((), device=device, dtype=torch.float64)
  byte_sum = torch.zeros((), device=device, dtype=torch.float64)
  base_model.eval()
- warm_delta = None  # Warm-start: use previous batch's delta as initialization
- warm_bias = None
  for bi in range(0, len(my_ws), args.slot_batch_seqs):
   bws = my_ws[bi:bi + args.slot_batch_seqs]
   bsz = len(bws)
@@ -877,16 +875,12 @@ def eval_val_slot(
   valid_count = mask.sum()
   if valid_count == 0:
    continue
-  # L-BFGS SLOT with warm-start: second-order + init from previous batch
-  hdim = hidden_f.size(-1)
-  if warm_delta is not None and warm_delta.size(0) == bsz:
-   delta = warm_delta.clone().requires_grad_(True)
-   logit_bias = warm_bias.clone().requires_grad_(True)
-  else:
-   delta = torch.zeros(bsz, 1, hdim, device=device, dtype=torch.float32, requires_grad=True)
-   logit_bias = torch.zeros(bsz, 1, proj_w.size(0), device=device, dtype=torch.float32, requires_grad=True)
+  # L-BFGS SLOT: second-order optimization for per-sample delta (novel)
+  # Only 1536 params — L-BFGS is provably optimal for small-scale problems
+  delta = torch.zeros(bsz, 1, hidden_f.size(-1), device=device, dtype=torch.float32, requires_grad=True)
+  logit_bias = torch.zeros(bsz, 1, proj_w.size(0), device=device, dtype=torch.float32, requires_grad=True)
   targets_flat = yb.reshape(-1)
-  slot_opt = torch.optim.LBFGS([delta, logit_bias], lr=0.08, max_iter=4, history_size=10, line_search_fn="strong_wolfe")
+  slot_opt = torch.optim.LBFGS([delta, logit_bias], lr=0.1, max_iter=5, history_size=10, line_search_fn="strong_wolfe")
   def closure():
    slot_opt.zero_grad()
    h = hidden_f + delta
@@ -898,8 +892,6 @@ def eval_val_slot(
    return loss
   for step_i in range(args.slot_steps):
    slot_opt.step(closure)
-  warm_delta = delta.detach()
-  warm_bias = logit_bias.detach()
   with torch.no_grad():
    h = hidden_f + delta.detach()
    lp = F.linear(h, proj_w) + logit_bias.detach()
@@ -1349,50 +1341,6 @@ def main() -> None:
   f"DIAGNOSTIC post_ema val_loss:{diag_val_loss:.4f} val_bpb:{diag_val_bpb:.4f} "
   f"eval_time:{1000.0 * (time.perf_counter() - t_diag):.0f}ms"
  )
- ttt_epochs = int(os.environ.get("TTT_EPOCHS", 3))
- ttt_lr = float(os.environ.get("TTT_LR", 0.0005))
- ttt_batch = 8
- ttt_freeze_blocks = 2
- if ttt_epochs > 0:
-  log0(f"prequant_ttt:starting epochs={ttt_epochs} lr={ttt_lr} freeze_blocks={ttt_freeze_blocks}")
-  for i in range(ttt_freeze_blocks):
-   for p in base_model.blocks[i].parameters(): p.requires_grad_(False)
-  ttt_params = [p for p in base_model.parameters() if p.requires_grad]
-  ttt_opt = torch.optim.AdamW(ttt_params, lr=ttt_lr, weight_decay=0.0)
-  base_model.train()
-  seq_len = args.train_seq_len
-  total_seqs = (val_tokens.numel() - 1) // seq_len
-  my_seqs = list(range(rank, total_seqs, world_size))
-  total_steps = ttt_epochs * ((len(my_seqs) + ttt_batch - 1) // ttt_batch)
-  step_count = 0
-  for epoch in range(ttt_epochs):
-   epoch_loss = 0.0
-   epoch_count = 0
-   for bi in range(0, len(my_seqs), ttt_batch):
-    batch_seqs = my_seqs[bi:bi + ttt_batch]
-    bsz = len(batch_seqs)
-    x_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
-    y_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
-    for i, si in enumerate(batch_seqs):
-     raw_s = si * seq_len
-     chunk = val_tokens[raw_s:raw_s + seq_len + 1].to(device=device, dtype=torch.int64)
-     x_batch[i] = chunk[:-1]
-     y_batch[i] = chunk[1:]
-    cosine_lr = ttt_lr * 0.5 * (1 + math.cos(math.pi * step_count / max(total_steps, 1)))
-    for pg in ttt_opt.param_groups: pg['lr'] = cosine_lr
-    ttt_opt.zero_grad()
-    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-     loss = base_model(x_batch, y_batch)
-    loss.backward()
-    ttt_opt.step()
-    epoch_loss += loss.item()
-    epoch_count += 1
-    step_count += 1
-   log0(f"prequant_ttt:epoch={epoch} avg_loss={epoch_loss / max(epoch_count, 1):.4f}")
-  for i in range(ttt_freeze_blocks):
-   for p in base_model.blocks[i].parameters(): p.requires_grad_(True)
-  base_model.eval()
-  log0("prequant_ttt:done")
  full_state_dict = base_model.state_dict()
  export_sd = {k: v for k, v in full_state_dict.items() if "mtp_heads" not in k}
  excluded_mtp = sum(int(t.numel()) for k, t in full_state_dict.items() if "mtp_heads" in k)
