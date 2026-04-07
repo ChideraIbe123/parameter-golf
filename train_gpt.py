@@ -95,7 +95,7 @@ class Hyperparameters:
  ve_layers = os.environ.get("VE_LAYERS", "9,10")
  vrl_enabled = bool(int(os.environ.get("VRL_ENABLED", "1")))
  slot_enabled = bool(int(os.environ.get("SLOT_ENABLED", "1")))
- slot_steps = int(os.environ.get("SLOT_STEPS", 10))
+ slot_steps = int(os.environ.get("SLOT_STEPS", 8))
  slot_lr = float(os.environ.get("SLOT_LR", 0.012))
  slot_lr_min = float(os.environ.get("SLOT_LR_MIN", 0.001))
  slot_batch_seqs = int(os.environ.get("SLOT_BATCH_SEQS", 32))
@@ -1349,6 +1349,33 @@ def main() -> None:
   f"DIAGNOSTIC post_ema val_loss:{diag_val_loss:.4f} val_bpb:{diag_val_bpb:.4f} "
   f"eval_time:{1000.0 * (time.perf_counter() - t_diag):.0f}ms"
  )
+ ttt_epochs = int(os.environ.get("TTT_EPOCHS", 6))
+ ttt_lr = float(os.environ.get("TTT_LR", 0.0005))
+ if ttt_epochs > 0:
+  log0(f"prequant_ttt:starting epochs={ttt_epochs} lr={ttt_lr}")
+  ttt_opt = torch.optim.AdamW(base_model.parameters(), lr=ttt_lr, weight_decay=0.0)
+  base_model.train()
+  seq_len = args.train_seq_len
+  total_seqs = (val_tokens.numel() - 1) // seq_len
+  for epoch in range(ttt_epochs):
+   epoch_loss = 0.0
+   epoch_count = 0
+   for seq_start in range(rank, total_seqs, world_size):
+    raw_start = seq_start * seq_len
+    raw_end = raw_start + seq_len + 1
+    local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64)
+    x = local[:-1].unsqueeze(0)
+    y = local[1:].unsqueeze(0)
+    ttt_opt.zero_grad()
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+     loss = base_model(x, y)
+    loss.backward()
+    ttt_opt.step()
+    epoch_loss += loss.item()
+    epoch_count += 1
+   log0(f"prequant_ttt:epoch={epoch} avg_loss={epoch_loss / max(epoch_count, 1):.4f}")
+  base_model.eval()
+  log0("prequant_ttt:done")
  full_state_dict = base_model.state_dict()
  export_sd = {k: v for k, v in full_state_dict.items() if "mtp_heads" not in k}
  excluded_mtp = sum(int(t.numel()) for k, t in full_state_dict.items() if "mtp_heads" in k)
