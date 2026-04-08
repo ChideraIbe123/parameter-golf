@@ -834,6 +834,7 @@ class NgramMixer:
   s.seen=0; s.uni=torch.zeros(V,device=dev); s.ut=0.0
   s.ctx=[torch.zeros(B,device=dev) for _ in range(maxN-1)]
   s.full=[torch.zeros(B,device=dev) for _ in range(maxN-1)]
+  s.w_neural=0.5; s.w_ngram=0.5; s.eta=0.05
  def _bk(s,h): return h & s.M
  def update(s, t):
   t=t.to(s.dev).long(); n=t.numel(); s.seen+=n
@@ -871,10 +872,15 @@ class NgramMixer:
    if bool(v.any()):
     ei=torch.where(el)[0]; d=ei[v]
     gp[d]=(fc[v].clamp(max=cc[v])/cc[v].clamp(min=1)).clamp(0,1); gh[d]=True
+  wg=s.w_ngram/(s.w_neural+s.w_ngram)
   pr=lp.exp(); ent=-(pr[ar,ac]*lp[ar,ac]).sum(dim=-1)
-  al=0.20+0.55*torch.sigmoid(2.0*(ent-2.5))
-  mp=(1.0-al)*npa+al*gp; out=nll.clone()
-  out[ar,ac]=-mp.clamp(min=1e-12).log(); return out
+  al_base=wg+0.3*torch.sigmoid(2.0*(ent-2.5))
+  al=al_base.clamp(0.05,0.95)
+  mp=((1.0-al)*npa+al*gp).clamp(min=1e-12)
+  nl_n=-npa.clamp(min=1e-12).log().mean(); nl_g=-gp.clamp(min=1e-12).log().mean()
+  s.w_neural*=math.exp(-s.eta*nl_n.item()); s.w_ngram*=math.exp(-s.eta*nl_g.item())
+  wsum=s.w_neural+s.w_ngram; s.w_neural/=wsum; s.w_ngram/=wsum
+  out=nll.clone(); out[ar,ac]=-mp.log(); return out
 
 def eval_val_slot(
  args: Hyperparameters,
