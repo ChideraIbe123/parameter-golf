@@ -834,6 +834,9 @@ class NgramMixer:
   s.seen=0; s.uni=torch.zeros(V,device=dev); s.ut=0.0
   s.ctx=[torch.zeros(B,device=dev) for _ in range(maxN-1)]
   s.full=[torch.zeros(B,device=dev) for _ in range(maxN-1)]
+  s.K=maxN+1
+  s.hedge_w=torch.ones(s.K,device=dev)/s.K
+  s.hedge_eta=0.1
  def _bk(s,h): return h & s.M
  def update(s, t):
   t=t.to(s.dev).long(); n=t.numel(); s.seen+=n
@@ -857,11 +860,15 @@ class NgramMixer:
   pos=torch.arange(slen,device=s.dev,dtype=torch.int64).view(1,-1)
   am=(pos>=st)&(pos<et)
   if s.seen<s.minT or not bool(am.any()): return nll
-  ar,ac=torch.where(am); npa=np_[ar,ac]
-  gp=(s.uni[yb[ar,ac]]+0.5)/(s.ut+0.5*V) if s.ut>0 else torch.full((ar.numel(),),1.0/V,device=s.dev)
-  gh=torch.zeros(ar.numel(),device=s.dev,dtype=torch.bool)
-  for o in range(s.maxN,1,-1):
-   oi=o-2; cw=o-1; el=(ac>=(cw-1))&(~gh)
+  ar,ac=torch.where(am); N=ar.numel()
+  npa=np_[ar,ac]
+  ep=torch.zeros(s.K, N, device=s.dev)
+  ev=torch.zeros(s.K, N, device=s.dev, dtype=torch.bool)
+  ep[0]=npa; ev[0]=True
+  if s.ut>0:
+   ep[1]=(s.uni[yb[ar,ac]]+0.5)/(s.ut+0.5*V); ev[1]=True
+  for o in range(2,s.maxN+1):
+   oi=o-2; cw=o-1; el=ac>=(cw-1); eidx=min(o,s.K-1)
    if not bool(el.any()): continue
    r,c=ar[el],ac[el]
    ch=xb[r,c-(cw-1)]*s.P[0]
@@ -869,12 +876,16 @@ class NgramMixer:
    ck=s._bk(ch); fh=ch^(yb[r,c]*s.P[(o-1)%len(s.P)]); fk=s._bk(fh)
    cc=s.ctx[oi][ck]; fc=s.full[oi][fk]; v=cc>=s.minC
    if bool(v.any()):
-    ei=torch.where(el)[0]; d=ei[v]
-    gp[d]=(fc[v].clamp(max=cc[v])/cc[v].clamp(min=1)).clamp(0,1); gh[d]=True
-  pr=lp.exp(); ent=-(pr[ar,ac]*lp[ar,ac]).sum(dim=-1)
-  al=0.20+0.55*torch.sigmoid(2.0*(ent-2.5))
-  mp=(1.0-al)*npa+al*gp; out=nll.clone()
-  out[ar,ac]=-mp.clamp(min=1e-12).log(); return out
+    eli=torch.where(el)[0]
+    p=(fc[v].clamp(max=cc[v])/cc[v].clamp(min=1)).clamp(1e-12,1)
+    ep[eidx,eli[v]]=p; ev[eidx,eli[v]]=True
+  ep[~ev]=1.0/V
+  w=s.hedge_w[:ep.size(0)].unsqueeze(1)
+  mp=(w*ep).sum(dim=0).clamp(min=1e-12)
+  el=-ep.clamp(min=1e-12).log().mean(dim=1)
+  s.hedge_w[:ep.size(0)]*=torch.exp(-s.hedge_eta*el)
+  s.hedge_w/=s.hedge_w.sum()
+  out=nll.clone(); out[ar,ac]=-mp.log(); return out
 
 def eval_val_slot(
  args: Hyperparameters,
