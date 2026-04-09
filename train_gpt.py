@@ -940,6 +940,8 @@ def eval_val_slot(
  token_count = torch.zeros((), device=device, dtype=torch.float64)
  byte_sum = torch.zeros((), device=device, dtype=torch.float64)
  ngm = NgramMixer(args.vocab_size, device)
+ prev_delta = None
+ prev_bias = None
  base_model.eval()
  for bi in range(0, len(my_ws), args.slot_batch_seqs):
   bws = my_ws[bi:bi + args.slot_batch_seqs]
@@ -987,8 +989,10 @@ def eval_val_slot(
    continue
   # L-BFGS SLOT: second-order optimization for per-sample delta (novel)
   # Only 1536 params — L-BFGS is provably optimal for small-scale problems
-  delta = torch.zeros(bsz, 1, hidden_f.size(-1), device=device, dtype=torch.float32, requires_grad=True)
-  logit_bias = torch.zeros(bsz, 1, proj_w.size(0), device=device, dtype=torch.float32, requires_grad=True)
+  d_init = prev_delta.mean(0, keepdim=True).expand(bsz, -1, -1).clone() if prev_delta is not None else torch.zeros(bsz, 1, hidden_f.size(-1), device=device, dtype=torch.float32)
+  b_init = prev_bias.mean(0, keepdim=True).expand(bsz, -1, -1).clone() if prev_bias is not None else torch.zeros(bsz, 1, proj_w.size(0), device=device, dtype=torch.float32)
+  delta = d_init.requires_grad_(True)
+  logit_bias = b_init.requires_grad_(True)
   targets_flat = yb.reshape(-1)
   slot_opt = torch.optim.LBFGS([delta, logit_bias], lr=0.1, max_iter=5, history_size=10, line_search_fn="strong_wolfe")
   def closure():
@@ -1002,6 +1006,8 @@ def eval_val_slot(
    return loss
   for step_i in range(args.slot_steps):
    slot_opt.step(closure)
+  prev_delta = delta.detach().clone()
+  prev_bias = logit_bias.detach().clone()
   with torch.no_grad():
    h = hidden_f + delta.detach()
    lp = F.linear(h, proj_w) + logit_bias.detach()
