@@ -95,14 +95,10 @@ class Hyperparameters:
  ve_layers = os.environ.get("VE_LAYERS", "9,10")
  vrl_enabled = bool(int(os.environ.get("VRL_ENABLED", "1")))
  slot_enabled = bool(int(os.environ.get("SLOT_ENABLED", "1")))
- slot_steps = int(os.environ.get("SLOT_STEPS", 6))
+ slot_steps = int(os.environ.get("SLOT_STEPS", 8))
  slot_lr = float(os.environ.get("SLOT_LR", 0.012))
  slot_lr_min = float(os.environ.get("SLOT_LR_MIN", 0.001))
  slot_batch_seqs = int(os.environ.get("SLOT_BATCH_SEQS", 32))
- ttt_enabled = False
- ttt_eta = float(os.environ.get("TTT_ETA", 0.1))
- ttt_layers_str = os.environ.get("TTT_LAYERS", "10")
- ttt_clip = float(os.environ.get("TTT_CLIP", 0.1))
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
  a, b, c = (3.4445, -4.7750, 2.0315)
  X = G.bfloat16()
@@ -522,36 +518,15 @@ class ValueEmbedding(nn.Module):
    h = self.proj(h)
   return h * self.scale.to(dtype=h.dtype)
 class MLP(nn.Module):
- def __init__(self, dim: int, mlp_mult: int, ttt: bool = False):
+ def __init__(self, dim: int, mlp_mult: int):
   super().__init__()
   hidden = int(mlp_mult * dim)
   self.fc = CastedLinear(dim, hidden, bias=False)
   self.proj = CastedLinear(hidden, dim, bias=False)
   self.proj._zero_init = True
-  self.ttt = ttt
-  if ttt:
-   self.ttt_conv = nn.Conv1d(dim, dim, kernel_size=5, padding=4, groups=dim, bias=False)
-   nn.init.normal_(self.ttt_conv.weight, std=0.02)
-   self.ttt_target = CastedLinear(dim, dim, bias=False)
-   nn.init.eye_(self.ttt_target.weight)
-   self.ttt_target.weight.data.mul_(0.1)
- def get_v_target(self, x0: Tensor) -> Tensor:
-  x0 = x0.to(self.ttt_conv.weight.dtype)
-  return self.ttt_target(self.ttt_conv(x0.transpose(1, 2))[:, :, :x0.size(1)].transpose(1, 2)).float()
- def forward(self, x: Tensor, x0: Tensor | None = None) -> Tensor:
-  h = F.leaky_relu(self.fc(x), negative_slope=0.5)
-  z = h.square()
-  out = self.proj(z)
-  if self.ttt and self.training and x0 is not None:
-   v = self.get_v_target(x0)
-   mid = z.size(1) // 2
-   dw = torch.einsum('bsd,bsh->dh', v[:, :mid], z[:, :mid].detach())
-   dn = dw.norm().clamp(min=1e-8)
-   dw = dw * torch.clamp(torch.tensor(0.01, device=dw.device) / dn, max=1.0)
-   corr = F.linear(z, dw)
-   mask = (torch.arange(z.size(1), device=z.device) >= mid).to(out.dtype)
-   out = out + corr * mask[None, :, None]
-  return out
+ def forward(self, x: Tensor) -> Tensor:
+  x = F.leaky_relu(self.fc(x), negative_slope=0.5)
+  return self.proj(x.square())
 class Block(nn.Module):
  def __init__(
   self,
@@ -564,13 +539,12 @@ class Block(nn.Module):
   layer_idx: int = 0,
   ln_scale: bool = False,
   dtg: bool = False,
-  ttt: bool = False,
  ):
   super().__init__()
   self.attn_norm = RMSNorm()
   self.mlp_norm = RMSNorm()
   self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-  self.mlp = MLP(dim, mlp_mult, ttt=ttt)
+  self.mlp = MLP(dim, mlp_mult)
   self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
   self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
   self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -586,7 +560,7 @@ class Block(nn.Module):
   x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
   attn_out, v_raw = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, v_embed=v_embed, v_first=v_first)
   x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
-  x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor, x0)
+  x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor)
   if self.dtg_gate is not None:
    gate = torch.sigmoid(self.dtg_gate(x_in.detach()))
    x_out = x_in + gate * (x_out - x_in)
@@ -617,10 +591,8 @@ class GPT(nn.Module):
   ve_dim: int = 128,
   ve_layers: str = "9,10",
   vrl_enabled: bool = False,
-  ttt_layers: list[int] | None = None,
  ):
   super().__init__()
-  self.ttt_layer_indices = ttt_layers or []
   self._ve_target_dim = num_kv_heads * (model_dim // num_heads)  # kv_dim for value projection
   if logit_softcap <= 0.0:
    raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
@@ -648,7 +620,6 @@ class GPT(nn.Module):
      layer_idx=i,
      ln_scale=ln_scale,
      dtg=dtg,
-     ttt=(i in self.ttt_layer_indices),
     )
     for i in range(num_layers)
    ]
@@ -856,61 +827,6 @@ def eval_val_sliding(
  tokens_per_byte = token_count.item() / byte_count.item()
  base_model.train()
  return val_loss, bits_per_token * tokens_per_byte
-class NgramMixer:
- P = [36313, 27191, 51647, 81929, 131071, 174763, 233017, 282527, 357347, 451439]
- def __init__(s, V, dev, B=1<<22, maxN=12, minC=2, minT=5000):
-  s.V,s.B,s.M,s.maxN,s.minC,s.minT,s.dev = V,B,B-1,maxN,minC,minT,dev
-  s.seen=0; s.uni=torch.zeros(V,device=dev); s.ut=0.0
-  s.ctx=[torch.zeros(B,device=dev) for _ in range(maxN-1)]
-  s.full=[torch.zeros(B,device=dev) for _ in range(maxN-1)]
- def _bk(s,h): return h & s.M
- def update(s, t):
-  t=t.to(s.dev).long(); n=t.numel(); s.seen+=n
-  ones=torch.ones(n,device=s.dev)
-  s.uni.scatter_add_(0,t,ones); s.ut+=n
-  for o in range(2,s.maxN+1):
-   if n<o: continue
-   oi=o-2; nxt=t[o-1:]
-   ch=t[0:n-o+1]*s.P[0]
-   for k in range(1,o-1): ch=ch^(t[k:n-o+1+k]*s.P[k%len(s.P)])
-   ck=s._bk(ch); fh=ch^(nxt*s.P[(o-1)%len(s.P)]); fk=s._bk(fh)
-   s.ctx[oi].scatter_add_(0,ck,ones[:n-o+1])
-   s.full[oi].scatter_add_(0,fk,ones[:n-o+1])
- def score(s, lg, xb, yb, starts, lens):
-  bsz,slen,V=lg.shape
-  lp=F.log_softmax(lg.float(),dim=-1)
-  np_=lp.gather(-1,yb.unsqueeze(-1)).squeeze(-1).exp()
-  nll=-np_.clamp(min=1e-12).log()
-  st=torch.as_tensor(starts,device=s.dev,dtype=torch.int64).view(-1,1)
-  et=torch.as_tensor(lens,device=s.dev,dtype=torch.int64).view(-1,1)
-  pos=torch.arange(slen,device=s.dev,dtype=torch.int64).view(1,-1)
-  am=(pos>=st)&(pos<et)
-  if s.seen<s.minT or not bool(am.any()): return nll
-  ar,ac=torch.where(am); N=ar.numel(); npa=np_[ar,ac]
-  gp=(s.uni[yb[ar,ac]]+0.5)/(s.ut+0.5*V) if s.ut>0 else torch.full((N,),1.0/V,device=s.dev)
-  gh=torch.zeros(N,device=s.dev,dtype=torch.bool)
-  g_order=torch.zeros(N,device=s.dev)
-  g_ctxcount=torch.ones(N,device=s.dev)
-  for o in range(s.maxN,1,-1):
-   oi=o-2; cw=o-1; el=(ac>=(cw-1))&(~gh)
-   if not bool(el.any()): continue
-   r,c=ar[el],ac[el]
-   ch=xb[r,c-(cw-1)]*s.P[0]
-   for k in range(1,cw): ch=ch^(xb[r,c-(cw-1)+k]*s.P[k%len(s.P)])
-   ck=s._bk(ch); fh=ch^(yb[r,c]*s.P[(o-1)%len(s.P)]); fk=s._bk(fh)
-   cc=s.ctx[oi][ck]; fc=s.full[oi][fk]; v=cc>=s.minC
-   if bool(v.any()):
-    ei=torch.where(el)[0]; d=ei[v]
-    gp[d]=(fc[v].clamp(max=cc[v])/cc[v].clamp(min=1)).clamp(0,1)
-    g_order[d]=float(o); g_ctxcount[d]=cc[v]; gh[d]=True
-  pr=lp.exp(); ent=-(pr[ar,ac]*lp[ar,ac]).sum(dim=-1)
-  order_feat=(g_order/s.maxN).clamp(max=1.0)
-  count_feat=(g_ctxcount.clamp(min=1).log()/5.0).clamp(max=1.0)
-  al=0.15+0.50*torch.sigmoid(2.0*(ent-2.5))+0.35*order_feat+0.20*count_feat
-  al=al.clamp(max=0.95)
-  mp=((1.0-al)*npa+al*gp).clamp(min=1e-12); out=nll.clone()
-  out[ar,ac]=-mp.log(); return out
-
 def eval_val_slot(
  args: Hyperparameters,
  base_model: nn.Module,
@@ -929,18 +845,10 @@ def eval_val_slot(
  else:
   proj_w = base_model.lm_head.weight.detach().float()
  softcap = base_model.logit_softcap
- ttt_layers = [int(x) for x in args.ttt_layers_str.split(",") if x.strip()] if args.ttt_enabled else []
- ttt_deltas = {li: torch.zeros_like(base_model.blocks[li].mlp.proj.weight.data) for li in ttt_layers}
- use_ttt = len(ttt_layers) > 0
- if use_ttt:
-  forward_fn = base_model.forward_hidden
- else:
-  forward_fn = torch.compile(base_model.forward_hidden, dynamic=False, fullgraph=False)
+ compiled_hidden = torch.compile(base_model.forward_hidden, dynamic=False, fullgraph=False)
  loss_sum = torch.zeros((), device=device, dtype=torch.float64)
  token_count = torch.zeros((), device=device, dtype=torch.float64)
  byte_sum = torch.zeros((), device=device, dtype=torch.float64)
- prev_delta = None
- prev_bias = None
  base_model.eval()
  for bi in range(0, len(my_ws), args.slot_batch_seqs):
   bws = my_ws[bi:bi + args.slot_batch_seqs]
@@ -956,27 +864,8 @@ def eval_val_slot(
    yb_cpu[i, :wlen] = val_tokens[ws + 1:wend + 1]
   xb = xb_cpu.to(device=device, non_blocking=True)
   yb = yb_cpu.to(device=device, non_blocking=True)
-  layer_z = {}
-  x0_ref = {}
-  hooks = []
-  if use_ttt:
-   def _x0_hook(module, inp, out):
-    x0_ref['v'] = out.detach().float()
-   hooks.append(base_model.smear.register_forward_hook(_x0_hook))
-   for _li in ttt_layers:
-    def _make_proj_hook(idx):
-     _delta = ttt_deltas[idx]
-     def _hook(module, inp, out):
-      z = inp[0]
-      layer_z[idx] = z.detach().float()
-      if _delta.any():
-       return out + F.linear(z.float(), _delta).to(out.dtype)
-     return _hook
-    hooks.append(base_model.blocks[_li].mlp.proj.register_forward_hook(_make_proj_hook(_li)))
   with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-   hidden = forward_fn(xb)
-  for h in hooks:
-   h.remove()
+   hidden = compiled_hidden(xb)
   hidden_f = hidden.detach().float()
   mask = torch.zeros(bsz, seq_s, device=device)
   for i, ws in enumerate(bws):
@@ -988,10 +877,8 @@ def eval_val_slot(
    continue
   # L-BFGS SLOT: second-order optimization for per-sample delta (novel)
   # Only 1536 params — L-BFGS is provably optimal for small-scale problems
-  d_init = prev_delta.mean(0, keepdim=True).expand(bsz, -1, -1).clone() if prev_delta is not None else torch.zeros(bsz, 1, hidden_f.size(-1), device=device, dtype=torch.float32)
-  b_init = prev_bias.mean(0, keepdim=True).expand(bsz, -1, -1).clone() if prev_bias is not None else torch.zeros(bsz, 1, proj_w.size(0), device=device, dtype=torch.float32)
-  delta = d_init.requires_grad_(True)
-  logit_bias = b_init.requires_grad_(True)
+  delta = torch.zeros(bsz, 1, hidden_f.size(-1), device=device, dtype=torch.float32, requires_grad=True)
+  logit_bias = torch.zeros(bsz, 1, proj_w.size(0), device=device, dtype=torch.float32, requires_grad=True)
   targets_flat = yb.reshape(-1)
   slot_opt = torch.optim.LBFGS([delta, logit_bias], lr=0.1, max_iter=5, history_size=10, line_search_fn="strong_wolfe")
   def closure():
@@ -1005,33 +892,22 @@ def eval_val_slot(
    return loss
   for step_i in range(args.slot_steps):
    slot_opt.step(closure)
-  prev_delta = delta.detach().clone()
-  prev_bias = logit_bias.detach().clone()
   with torch.no_grad():
    h = hidden_f + delta.detach()
    lp = F.linear(h, proj_w) + logit_bias.detach()
    lg = softcap * torch.tanh(lp / softcap)
-   starts = [0 if ws == 0 else max(wlens[i] - stride, 0) for i, ws in enumerate(bws)]
-   nll = F.cross_entropy(lg.reshape(-1, lg.size(-1)), yb.reshape(-1), reduction="none").reshape(bsz, seq_s)
+   nll = F.cross_entropy(lg.reshape(-1, lg.size(-1)), targets_flat, reduction="none").reshape(bsz, seq_s)
    for i, ws in enumerate(bws):
-    wlen = wlens[i]; s = starts[i]
-    loss_sum += nll[i, s:wlen].sum().to(torch.float64)
+    wlen = wlens[i]
+    s = 0 if ws == 0 else max(wlen - stride, 0)
+    chunk_nll = nll[i, s:wlen]
+    loss_sum += chunk_nll.sum().to(torch.float64)
     token_count += float(wlen - s)
-    prev_ids = xb[i, s:wlen]; tgt_ids = yb[i, s:wlen]
+    prev_ids = xb[i, s:wlen]
+    tgt_ids = yb[i, s:wlen]
     tb = base_bytes_lut[tgt_ids].to(torch.float64)
     tb += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(torch.float64)
     byte_sum += tb.sum()
-  if use_ttt and x0_ref.get('v') is not None:
-   with torch.no_grad():
-    for _li in ttt_layers:
-     if _li in layer_z:
-      v = base_model.blocks[_li].mlp.get_v_target(x0_ref['v'])
-      z = layer_z[_li]
-      dw = torch.einsum('bsd,bsh->dh', v, z)
-      dn = dw.norm()
-      if dn > args.ttt_clip:
-       dw = dw * (args.ttt_clip / dn)
-      ttt_deltas[_li] = ttt_deltas[_li] + args.ttt_eta * dw
  if dist.is_available() and dist.is_initialized():
   dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
   dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
@@ -1194,7 +1070,6 @@ def main() -> None:
  log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
  log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
  CastedLinear._qat_enabled = args.qat_enabled
- ttt_layers = [int(x) for x in args.ttt_layers_str.split(",") if x.strip()] if args.ttt_enabled else []
  base_model = GPT(
   vocab_size=args.vocab_size,
   num_layers=args.num_layers,
@@ -1219,7 +1094,6 @@ def main() -> None:
   ve_dim=args.ve_dim,
   ve_layers=args.ve_layers,
   vrl_enabled=args.vrl_enabled,
-  ttt_layers=ttt_layers,
  ).to(device).bfloat16()
  for module in base_model.modules():
   if isinstance(module, CastedLinear):
@@ -1240,9 +1114,6 @@ def main() -> None:
   for name, p in block_named_params
   if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
  ]
- for block in base_model.blocks:
-  if block.mlp.ttt:
-   scalar_params.append(block.mlp.ttt_conv.weight)
  if base_model.skip_weights.numel() > 0:
   scalar_params.append(base_model.skip_weights)
  scalar_params.append(base_model.smear.gate)
@@ -1511,11 +1382,10 @@ def main() -> None:
   logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
   mtp_num_heads=0, mtp_loss_weight=0.0,
   bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
-  xsa_last_n=args.xsa_last_n,
+  xsa_last_n=args.xsa_last_n,  # must match training model
   rope_dims=args.rope_dims, ln_scale=args.ln_scale, dtg=args.dtg_enabled,
   ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
   vrl_enabled=args.vrl_enabled,
-  ttt_layers=ttt_layers,
  ).to(device).bfloat16()
  for m in eval_model.modules():
   if isinstance(m, CastedLinear):
