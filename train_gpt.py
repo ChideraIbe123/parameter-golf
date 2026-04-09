@@ -533,7 +533,8 @@ class MLP(nn.Module):
    self.ttt_conv = nn.Conv1d(dim, dim, kernel_size=5, padding=4, groups=dim, bias=False)
    nn.init.zeros_(self.ttt_conv.weight)
    self.ttt_target = CastedLinear(dim, dim, bias=False)
-   nn.init.zeros_(self.ttt_target.weight)
+   nn.init.eye_(self.ttt_target.weight)
+   self.ttt_target.weight.data.mul_(0.01)
  def get_v_target(self, x0: Tensor) -> Tensor:
   return self.ttt_target(self.ttt_conv(x0.transpose(1, 2))[:, :, :x0.size(1)].transpose(1, 2))
  def forward(self, x: Tensor, x0: Tensor | None = None) -> Tensor:
@@ -543,11 +544,11 @@ class MLP(nn.Module):
   if self.ttt and self.training and x0 is not None:
    v = self.get_v_target(x0)
    mid = z.size(1) // 2
-   dw = torch.einsum('bsd,bsh->dh', v[:, :mid], z[:, :mid].detach()) / (z.size(0) * mid)
+   dw = torch.einsum('bsd,bsh->dh', v[:, :mid], z[:, :mid].detach())
    dn = dw.norm()
-   if dn > 0.1:
-    dw = dw * (0.1 / dn)
-   corr = 0.01 * F.linear(z, dw)
+   if dn > 1e-3:
+    dw = dw * (1e-3 / dn)
+   corr = F.linear(z, dw)
    mask = (torch.arange(z.size(1), device=z.device) >= mid).to(out.dtype)
    out = out + corr * mask[None, :, None]
   return out
@@ -1024,7 +1025,7 @@ def eval_val_slot(
      if _li in layer_z:
       v = base_model.blocks[_li].mlp.get_v_target(x0_ref['v'])
       z = layer_z[_li]
-      dw = torch.einsum('bsd,bsh->dh', v, z) / (z.size(0) * z.size(1))
+      dw = torch.einsum('bsd,bsh->dh', v, z)
       dn = dw.norm()
       if dn > args.ttt_clip:
        dw = dw * (args.ttt_clip / dn)
