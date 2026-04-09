@@ -940,6 +940,7 @@ def eval_val_slot(
  token_count = torch.zeros((), device=device, dtype=torch.float64)
  byte_sum = torch.zeros((), device=device, dtype=torch.float64)
  ngm = NgramMixer(args.vocab_size, device)
+ ngm_updated_to = 0
  prev_delta = None
  prev_bias = None
  base_model.eval()
@@ -1024,7 +1025,11 @@ def eval_val_slot(
     byte_sum += tb.sum()
    for i, ws in enumerate(bws):
     wlen = wlens[i]
-    ngm.update(yb[i, :wlen])
+    wend = ws + wlen
+    new_start = max(ngm_updated_to - ws, 0)
+    if new_start < wlen:
+     ngm.update(yb[i, new_start:wlen])
+    ngm_updated_to = max(ngm_updated_to, wend)
   if use_ttt and x0_ref.get('v') is not None:
    with torch.no_grad():
     for _li in ttt_layers:
