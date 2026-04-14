@@ -28,22 +28,89 @@ The paper's two main design choices we ported faithfully:
 2. **Score-first SGD per chunk** (commit NLL under `no_grad`, then run a
    gradient step on that chunk's loss)
 
-## What we tested
+## Experimental setup
 
-Fixed base stack throughout (PR #1493 architecture on SP1024: 11L × 512d,
-GQA 8/4, 3-layer depth recurrence L3-5, parallel residuals L7+, QK-Gain 5.0,
-GPTQ SDClip int6 + brotli). Same seed (1337). Only the TTT hyperparameters
-changed.
+**Fixed base stack** (identical across all TTT runs — only TTT hyperparameters
+vary):
 
-| Run | TTT_LR | Epochs | Scope (fraction of blocks) | Trainable params | val_bpb | Eval time |
-|-----|-------:|-------:|---------------------------:|-----------------:|--------:|----------:|
-| #1 defaults | 0.005 | 3 | last 25% (blocks 8–10) | 6.3M | 1.11137 | 408s |
-| #2 broader | **0.015** | **2** | **last 50% (blocks 5–10)** | **12.6M** | **1.11037** | 443s |
-| #3 aggressive | 0.05 | 5 | last 9% (block 10 only) | 2.1M | 1.11112 | 413s |
+- Architecture: 11 layers × 512 dim, GQA with 8 attention heads / 4 KV heads,
+  LeakyReLU(0.5)² MLP with 4× expansion, parallel residuals on blocks ≥ 7,
+  3-layer depth recurrence (blocks 3–5 looped twice more, activating at
+  35% of training)
+- Data: SP1024 tokenizer, 10 train shards (≈ 1.95B tokens), 62M val tokens
+- Training: Muon + Adam split (matrix_lr=0.022, embed_lr=0.6), WD=0.095,
+  EMA decay=0.9965, `MAX_WALLCLOCK_SECONDS=600`
+- Training result: 3,940 steps in 588s, pre-quant val_bpb 1.1250
+- Quantization: GPTQ SDClip (int6 matrices clip=12.85, int8 embeddings
+  clip=20.0, zero pruning) + brotli → 13.85 MB artifact
+- Hardware: 8× H100 SXM via RunPod official parameter-golf template
+- Seed: 1337 for every run (so training is bit-identical; only eval differs)
 
-We spanned 10× in learning rate (0.005 → 0.05), 6× in trainable params
-(2.1M → 12.6M), and 2.5× in epochs (2 → 5). The spread in final BPB is
-**0.001** — well within what a different seed would produce.
+### Experiment 1: paper defaults (conservative baseline)
+
+**Hypothesis**: the paper's published recipe (MLP-only, last 1/4 of blocks,
+SGD lr=0.005, 3 epochs/chunk) should give the baseline E2E TTT gain.
+
+Config: `TTT_LR=0.005 TTT_EPOCHS=3 TTT_E2E_LAST_FRAC=0.25`
+→ 6.3M trainable params (MLPs in blocks 8, 9, 10)
+
+| Eval stage | BPB | Δ |
+|------------|----:|---|
+| Post-quant (no eval adaptation) | 1.13604 | — |
+| Sliding window (stride 64) | 1.11230 | −0.02374 |
+| + E2E TTT | 1.11137 | −0.00093 |
+
+**Finding**: TTT delivered only −0.0009 BPB on top of sliding window —
+essentially noise. 408s eval time.
+
+### Experiment 2: broader, more aggressive updates
+
+**Hypothesis**: the paper's defaults are tuned for 3B models with much more
+adaptation capacity. At 27M, we should update *more* blocks with a *higher*
+LR to extract signal. Cut epochs to 2 to stay in time budget.
+
+Config: `TTT_LR=0.015 TTT_EPOCHS=2 TTT_E2E_LAST_FRAC=0.50`
+→ 12.6M trainable params (MLPs in blocks 5–10, i.e. half the network)
+
+Result: **val_bpb 1.11037** — 0.0010 better than Experiment 1.
+Eval time: 443s.
+
+**Finding**: doubling the update scope and tripling the LR moved the
+needle by 0.001 BPB. This is our *best* configuration, but the absolute
+improvement is minor.
+
+### Experiment 3: aggressive single-block adaptation
+
+**Hypothesis**: maybe the bottleneck isn't scope but *intensity*. Update
+only the very last MLP (block 10) but push it hard — LR 10× higher than
+paper, 5 epochs per chunk, lots of optimization signal concentrated on
+2.1M params.
+
+Config: `TTT_LR=0.05 TTT_EPOCHS=5 TTT_E2E_LAST_FRAC=0.09`
+→ 2.1M trainable params (MLP in block 10 only)
+
+Result: **val_bpb 1.11112** — 0.0008 worse than Experiment 2, 0.0003
+better than Experiment 1. Eval time: 413s.
+
+**Finding**: hammering a single block with 10× the learning rate did not
+help. The block-10 MLP doesn't have enough representation space to absorb
+the fine-grained corrections TTT wants to make per-chunk. More params
+with a moderate LR beats fewer params with an aggressive LR.
+
+### Summary of ablations
+
+| Run | TTT_LR | Epochs | Scope | Params | val_bpb | Eval time |
+|-----|-------:|-------:|------:|-------:|--------:|----------:|
+| #1 defaults | 0.005 | 3 | last 25% (L8–L10) | 6.3M | 1.11137 | 408s |
+| **#2 broader** | **0.015** | **2** | **last 50% (L5–L10)** | **12.6M** | **1.11037** | 443s |
+| #3 aggressive | 0.05 | 5 | last 9% (L10 only) | 2.1M | 1.11112 | 413s |
+
+We spanned **10× in learning rate** (0.005 → 0.05), **6× in trainable
+params** (2.1M → 12.6M), and **2.5× in epochs per chunk** (2 → 5). The
+total spread in final BPB was **0.001** — well within the noise floor a
+different random seed would produce on this model size. The ablation is
+not "run #2 is the clear winner"; it's "E2E TTT doesn't meaningfully
+discriminate between these configurations at 27M scale".
 
 ## What we learned
 
