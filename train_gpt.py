@@ -142,13 +142,15 @@ if _HAS_TRITON and _HAS_TMA:
 				if FUSE_RMS:
 					a=(a*row_scale[:,None]).to(dtype)
 				b=b_desc.load([offs_bn,offs_k]);accumulator=tl.dot(a,b.T,accumulator)
-			tile_id_c+=NUM_SMS;offs_am_c=offs_am;offs_bn_c=offs_bn;acc=tl.reshape(accumulator,(BLOCK_SIZE_M,2,BLOCK_SIZE_N//2));acc=tl.permute(acc,(0,2,1));acc0,acc1=tl.split(acc);c0=acc0.to(dtype);c1=acc1.to(dtype)
+			tile_id_c+=NUM_SMS;offs_am_c=offs_am;offs_bn_c=offs_bn;acc=tl.reshape(accumulator,(BLOCK_SIZE_M,2,BLOCK_SIZE_N//2));acc=tl.permute(acc,(0,2,1));acc0,acc1=tl.split(acc)
 			if not FORWARD:
-				pre0=aux_desc.load([offs_am_c,offs_bn_c]);pre1=aux_desc.load([offs_am_c,offs_bn_c+BLOCK_SIZE_N//2])
-				c0=c0*tl.where(pre0>0,2.0*pre0,0.5*pre0);c1=c1*tl.where(pre1>0,2.0*pre1,0.5*pre1)
+				pre0_bf=aux_desc.load([offs_am_c,offs_bn_c]);pre1_bf=aux_desc.load([offs_am_c,offs_bn_c+BLOCK_SIZE_N//2]);pre0=pre0_bf.to(tl.float32);pre1=pre1_bf.to(tl.float32)
+				c0=(acc0*tl.where(pre0>0,2.0*pre0,0.5*pre0)).to(dtype);c1=(acc1*tl.where(pre1>0,2.0*pre1,0.5*pre1)).to(dtype)
+			else:
+				c0=acc0.to(dtype);c1=acc1.to(dtype)
 			c_desc.store([offs_am_c,offs_bn_c],c0);c_desc.store([offs_am_c,offs_bn_c+BLOCK_SIZE_N//2],c1)
 			if FORWARD:
-				aux0=tl.where(c0>0,c0,0.5*c0);aux1=tl.where(c1>0,c1,0.5*c1);aux_desc.store([offs_am_c,offs_bn_c],aux0*aux0);aux_desc.store([offs_am_c,offs_bn_c+BLOCK_SIZE_N//2],aux1*aux1)
+				aux0=tl.where(acc0>0,acc0,0.5*acc0);aux1=tl.where(acc1>0,acc1,0.5*acc1);aux_desc.store([offs_am_c,offs_bn_c],(aux0*aux0).to(dtype));aux_desc.store([offs_am_c,offs_bn_c+BLOCK_SIZE_N//2],(aux1*aux1).to(dtype))
 	def _compute_inv_rms(x_flat,eps=1e-6):
 		M,K=x_flat.shape;BLOCK_K=triton.next_power_of_2(K);inv_rms=torch.empty(M,device=x_flat.device,dtype=torch.bfloat16);_rms_inv_kernel[(M,)](x_flat,inv_rms,M,K,eps,BLOCK_K=BLOCK_K);return inv_rms
 	def _fused_linear_lrs(a,b,aux=None,inv_rms=None,ln_scale=1.0):
