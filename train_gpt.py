@@ -1388,7 +1388,7 @@ def main() -> None:
     log0("GPTQ:collecting Hessians from calibration data...")
     t_gptq = time.perf_counter()
     calib_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-    hessians = collect_hessians(compiled_model, calib_loader, args, device, n_calibration_batches=args.gptq_calibration_batches)
+    hessians = collect_hessians(base_model, calib_loader, args, device, n_calibration_batches=args.gptq_calibration_batches)
     log0(f"GPTQ:collected {len(hessians)} Hessians in {time.perf_counter() - t_gptq:.1f}s")
     quant_result, quant_meta = gptq_mixed_quantize(sd_cpu, hessians, args)
     quant_buf = io.BytesIO()
