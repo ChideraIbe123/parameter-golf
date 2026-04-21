@@ -854,7 +854,11 @@ class CausalSelfAttention(nn.Module):
         q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
         # Transpose to (B, H, T, D) for SDPA
         qh, kh, vh = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-        y = F.scaled_dot_product_attention(qh, kh, vh, is_causal=True, enable_gqa=(self.num_kv_heads != self.num_heads))
+        if self.num_heads != self.num_kv_heads:
+            rep = self.num_heads // self.num_kv_heads
+            kh = kh.repeat_interleave(rep, dim=1)
+            vh = vh.repeat_interleave(rep, dim=1)
+        y = F.scaled_dot_product_attention(qh, kh, vh, is_causal=True)
         y = y.transpose(1, 2).contiguous()  # (B, T, H, D)
         if self.use_xsa:
             y = self._xsa_efficient(y, v)
