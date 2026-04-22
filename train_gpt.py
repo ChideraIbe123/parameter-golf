@@ -1434,12 +1434,11 @@ def main() -> None:
         dist.barrier()
 
     eval_model, quant_state = _deserialize_eval_model()
-    compiled_eval = torch.compile(eval_model, dynamic=False, fullgraph=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
         args,
-        compiled_eval,
+        eval_model,
         rank,
         world_size,
         device,
@@ -1462,7 +1461,7 @@ def main() -> None:
 
     # Score-first TTT.
     if args.ttt_enabled and args.sliding_window_enabled:
-        del eval_model, compiled_eval
+        del eval_model
         torch._dynamo.reset()
         torch.cuda.empty_cache()
         ttt_model, _ = _deserialize_eval_model()
