@@ -1413,13 +1413,16 @@ def main() -> None:
         log0(f"Serialized model quantized+{args.compressor}: {quant_file_bytes} bytes")
         log0(f"Total submission size quantized+{args.compressor}: {bytes_total} bytes")
 
-    # Load dequantized weights into the EXISTING training model and eval with existing compiled model.
+    # Load dequantized weights. Key: convert CastedLinear to fp32 FIRST so dequantized
+    # fp32 weights stay fp32 (prevents GPTQ int6 -> fp32 -> bf16 double-quantization).
     if distributed:
         dist.barrier()
+    restore_fp32_params(base_model)
+    sd_fp32 = {k: v.detach().cpu() for k, v in base_model.state_dict().items()}
     with open("final_model.gptq.ptz", "rb") as f:
         quant_blob_disk = f.read()
     quant_state = torch.load(io.BytesIO(_decompress(quant_blob_disk, args.compressor)), map_location="cpu", weights_only=False)
-    deq_state = dequantize_mixed(quant_state["w"], quant_state["m"], sd_cpu)
+    deq_state = dequantize_mixed(quant_state["w"], quant_state["m"], sd_fp32)
     base_model.load_state_dict(deq_state, strict=True)
 
     # Use the EXISTING compiled+DDP model (which wraps base_model).
@@ -1443,7 +1446,8 @@ def main() -> None:
     # Score-first TTT.
     if args.ttt_enabled and args.sliding_window_enabled:
         # Reload fresh dequantized weights (TTT modifies them).
-        base_model.load_state_dict(deq_state, strict=True)
+        deq_state_fresh = dequantize_mixed(quant_state["w"], quant_state["m"], sd_fp32)
+        base_model.load_state_dict(deq_state_fresh, strict=True)
         torch.cuda.synchronize()
         t_ttt = time.perf_counter()
         ttt_loss, ttt_bpb = eval_val_ttt(args, rank, world_size, device, val_tokens, base_model, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut)
