@@ -764,6 +764,17 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
             if (param.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and param.dtype != torch.float32:
                 param.data = param.data.float()
 
+def restore_fp32_params(model: nn.Module) -> None:
+    # For eval: keep ALL CastedLinear weights in fp32 (CastedLinear.forward casts during matmul).
+    # This prevents double-quantization (GPTQ int6 -> fp32 -> bf16) when loading dequantized weights.
+    for module in model.modules():
+        if isinstance(module, CastedLinear):
+            module.float()
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if (param.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and param.dtype != torch.float32:
+                param.data = param.data.float()
+
 
 class Rotary(nn.Module):
     def __init__(self, dim: int, base: float = 10000.0, train_seq_len: int = 2048, rope_dims: int = 0):
@@ -1402,19 +1413,33 @@ def main() -> None:
         log0(f"Serialized model quantized+{args.compressor}: {quant_file_bytes} bytes")
         log0(f"Total submission size quantized+{args.compressor}: {bytes_total} bytes")
 
-    # Deserialize and eval the quantized model.
+    # Deserialize into a FRESH eval model (PR #1493 pattern).
+    # Critical: fresh model has CastedLinear in fp32 via restore_fp32_params.
+    # Dequantized fp32 weights stay fp32; CastedLinear.forward() casts to bf16 during matmul.
+    # This avoids double-quantization (GPTQ int6 -> fp32 -> bf16).
+    def _deserialize_eval_model():
+        eval_m = GPT(args).to(device).bfloat16()
+        restore_fp32_params(eval_m)
+        template_sd = {k: v.detach().cpu() for k, v in eval_m.state_dict().items()}
+        with open("final_model.gptq.ptz", "rb") as f:
+            blob = f.read()
+        qs = torch.load(io.BytesIO(_decompress(blob, args.compressor)), map_location="cpu", weights_only=False)
+        deq = dequantize_mixed(qs["w"], qs["m"], template_sd)
+        eval_m.load_state_dict(deq, strict=True)
+        if args.num_loops > 0:
+            eval_m.looping_active = True
+        return eval_m, qs
+
     if distributed:
         dist.barrier()
-    with open("final_model.gptq.ptz", "rb") as f:
-        quant_blob_disk = f.read()
-    quant_state = torch.load(io.BytesIO(_decompress(quant_blob_disk, args.compressor)), map_location="cpu", weights_only=False)
-    deq_state = dequantize_mixed(quant_state["w"], quant_state["m"], sd_cpu)
-    base_model.load_state_dict(deq_state, strict=True)
+
+    eval_model, quant_state = _deserialize_eval_model()
+    compiled_eval = torch.compile(eval_model, dynamic=False, fullgraph=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
         args,
-        model,
+        compiled_eval,
         rank,
         world_size,
         device,
@@ -1425,35 +1450,28 @@ def main() -> None:
         is_boundary_token_lut,
     )
     torch.cuda.synchronize()
-    log0(
-        f"quantized val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
-        f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
-    )
-    log0(f"quantized_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    log0(f"quantized val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms")
 
-    # Sliding window eval (better context utilization).
+    # Sliding window eval.
     if args.sliding_window_enabled:
-        if args.num_loops > 0:
-            base_model.looping_active = True
         torch.cuda.synchronize()
         t_sw = time.perf_counter()
-        sw_loss, sw_bpb = eval_val_sliding(args, rank, world_size, device, val_tokens, base_model, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut)
+        sw_loss, sw_bpb = eval_val_sliding(args, rank, world_size, device, val_tokens, eval_model, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut)
         torch.cuda.synchronize()
         log0(f"sliding_window val_loss:{sw_loss:.8f} val_bpb:{sw_bpb:.8f} eval_time:{1000.0 * (time.perf_counter() - t_sw):.0f}ms")
 
-    # Score-first TTT (PR #1493 — biggest eval-time lever).
+    # Score-first TTT.
     if args.ttt_enabled and args.sliding_window_enabled:
+        del eval_model, compiled_eval
         torch._dynamo.reset()
         torch.cuda.empty_cache()
-        # Reload quantized model fresh for TTT (TTT modifies weights).
-        base_model.load_state_dict(dequantize_mixed(quant_state["w"], quant_state["m"], sd_cpu), strict=True)
-        if args.num_loops > 0:
-            base_model.looping_active = True
+        ttt_model, _ = _deserialize_eval_model()
         torch.cuda.synchronize()
         t_ttt = time.perf_counter()
-        ttt_loss, ttt_bpb = eval_val_ttt(args, rank, world_size, device, val_tokens, base_model, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut)
+        ttt_loss, ttt_bpb = eval_val_ttt(args, rank, world_size, device, val_tokens, ttt_model, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut)
         torch.cuda.synchronize()
         log0(f"ttt val_loss:{ttt_loss:.8f} val_bpb:{ttt_bpb:.8f} eval_time:{1000.0 * (time.perf_counter() - t_ttt):.0f}ms")
+        del ttt_model
 
     if distributed:
         dist.destroy_process_group()
