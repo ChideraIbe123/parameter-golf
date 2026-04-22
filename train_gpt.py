@@ -93,12 +93,12 @@ class Hyperparameters:
 
     # Sliding window eval.
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
-    sliding_window_enabled = bool(int(os.environ.get("SLIDING_WINDOW_ENABLED", "1")))
+    sliding_window_enabled = bool(int(os.environ.get("SLIDING_WINDOW_ENABLED", "0")))
 
     # Score-first TTT (PR #1493).
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
     ttt_lr = float(os.environ.get("TTT_LR", 0.005))
-    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 3))
+    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 2))
     ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.9))
     ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", 32768))
 
@@ -1444,7 +1444,7 @@ def main() -> None:
         log0(f"sliding_window val_loss:{sw_loss:.8f} val_bpb:{sw_bpb:.8f} eval_time:{1000.0 * (time.perf_counter() - t_sw):.0f}ms")
 
     # Score-first TTT.
-    if args.ttt_enabled and args.sliding_window_enabled:
+    if args.ttt_enabled:
         # Reload fresh dequantized weights (TTT modifies them).
         deq_state_fresh = dequantize_mixed(quant_state["w"], quant_state["m"], sd_fp32)
         base_model.load_state_dict(deq_state_fresh, strict=True)
