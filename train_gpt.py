@@ -337,7 +337,6 @@ def eval_val_sliding(args, rank, world_size, device, val_tokens, base_model, bas
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
-    compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
     with torch.no_grad():
         for bi in range(0, len(my_windows), batch_seqs):
             bws = my_windows[bi:bi + batch_seqs]
@@ -353,7 +352,7 @@ def eval_val_sliding(args, rank, world_size, device, val_tokens, base_model, bas
                 xb[i, :wlen] = chunk[:-1]
                 yb[i, :wlen] = chunk[1:]
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                logits = compiled_logits(xb)
+                logits = base_model.forward_logits(xb)
             nll = F.cross_entropy(logits.reshape(-1, logits.size(-1)).float(), yb.reshape(-1), reduction="none").reshape(bsz, seq_len)
             for i, ws in enumerate(bws):
                 wlen = wlens[i]
@@ -390,7 +389,6 @@ def eval_val_ttt(args, rank, world_size, device, val_tokens, base_model, base_by
         scored_start = ws + s
         ci = min(scored_start // ttt_chunk, num_chunks - 1)
         chunk_windows[ci].append(ws)
-    compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
@@ -424,7 +422,7 @@ def eval_val_ttt(args, rank, world_size, device, val_tokens, base_model, base_by
                     xb[i, :wlen] = chunk_tok[:-1]
                     yb[i, :wlen] = chunk_tok[1:]
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    logits = compiled_logits(xb)
+                    logits = base_model.forward_logits(xb)
                 nll = F.cross_entropy(logits.reshape(-1, logits.size(-1)).float(), yb.reshape(-1), reduction="none").reshape(bsz, seq_len)
                 for i, ws in enumerate(bws):
                     wlen = wlens[i]
