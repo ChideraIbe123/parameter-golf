@@ -1413,7 +1413,7 @@ def main() -> None:
         log0(f"Serialized model quantized+{args.compressor}: {quant_file_bytes} bytes")
         log0(f"Total submission size quantized+{args.compressor}: {bytes_total} bytes")
 
-    # Load dequantized weights back into the training model for eval.
+    # Load dequantized weights into the EXISTING training model and eval with existing compiled model.
     if distributed:
         dist.barrier()
     with open("final_model.gptq.ptz", "rb") as f:
@@ -1421,24 +1421,13 @@ def main() -> None:
     quant_state = torch.load(io.BytesIO(_decompress(quant_blob_disk, args.compressor)), map_location="cpu", weights_only=False)
     deq_state = dequantize_mixed(quant_state["w"], quant_state["m"], sd_cpu)
     base_model.load_state_dict(deq_state, strict=True)
-    if args.num_loops > 0:
-        base_model.looping_active = True
-    torch._dynamo.reset()
-    compiled_eval = torch.compile(base_model, dynamic=False, fullgraph=True)
-    eval_model_for_val = DDP(compiled_eval, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_eval
+
+    # Use the EXISTING compiled+DDP model (which wraps base_model).
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
-        args,
-        eval_model_for_val,
-        rank,
-        world_size,
-        device,
-        grad_accum_steps,
-        val_tokens,
-        base_bytes_lut,
-        has_leading_space_lut,
-        is_boundary_token_lut,
+        args, model, rank, world_size, device, grad_accum_steps,
+        val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
     )
     torch.cuda.synchronize()
     log0(f"quantized val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms")
@@ -1453,12 +1442,8 @@ def main() -> None:
 
     # Score-first TTT.
     if args.ttt_enabled and args.sliding_window_enabled:
-        torch._dynamo.reset()
-        torch.cuda.empty_cache()
         # Reload fresh dequantized weights (TTT modifies them).
         base_model.load_state_dict(deq_state, strict=True)
-        if args.num_loops > 0:
-            base_model.looping_active = True
         torch.cuda.synchronize()
         t_ttt = time.perf_counter()
         ttt_loss, ttt_bpb = eval_val_ttt(args, rank, world_size, device, val_tokens, base_model, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut)
