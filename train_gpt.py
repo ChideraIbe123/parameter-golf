@@ -106,7 +106,7 @@ class Hyperparameters:
     gptq_calibration_batches = int(os.environ.get("GPTQ_CALIBRATION_BATCHES", 64))
     matrix_bits = int(os.environ.get("MATRIX_BITS", 6))
     embed_bits = int(os.environ.get("EMBED_BITS", 8))
-    matrix_clip_sigmas = float(os.environ.get("MATRIX_CLIP_SIGMAS", 3.0))
+    matrix_clip_sigmas = float(os.environ.get("MATRIX_CLIP_SIGMAS", 6.0))
     embed_clip_sigmas = float(os.environ.get("EMBED_CLIP_SIGMAS", 20.0))
     compressor = os.environ.get("COMPRESSOR", "brotli")
 
