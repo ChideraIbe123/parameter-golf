@@ -1405,6 +1405,12 @@ def main() -> None:
     if args.ema_decay > 0 and ema_state is not None:
         base_model.load_state_dict(ema_state, strict=True)
         log0("ema:applying EMA weights")
+        # DIAGNOSTIC: eval post-EMA pre-quant to isolate EMA vs GPTQ degradation.
+        torch.cuda.synchronize()
+        t_ema_eval = time.perf_counter()
+        ema_loss, ema_bpb = eval_val(args, model, rank, world_size, device, grad_accum_steps, val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut)
+        torch.cuda.synchronize()
+        log0(f"post_ema_pre_quant val_loss:{ema_loss:.4f} val_bpb:{ema_bpb:.4f} eval_time:{1000.0 * (time.perf_counter() - t_ema_eval):.0f}ms")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
