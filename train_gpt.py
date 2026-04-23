@@ -83,7 +83,7 @@ class Hyperparameters:
     num_layers = int(os.environ.get("NUM_LAYERS", 11))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
-    embedding_dim = int(os.environ.get("EMBEDDING_DIM", str(max((3 * model_dim) // 4, 256) if osp_lite_enabled else model_dim)))
+    embedding_dim = int(os.environ.get("EMBEDDING_DIM", str(max((7 * model_dim) // 8, 448) if osp_lite_enabled else model_dim)))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 4))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
@@ -962,7 +962,6 @@ class Block(nn.Module):
         ln_scale: bool = False,
         attn_gate_enabled: bool = False,
         layer_scale_init: float = 1.0,
-        osp_lite_enabled: bool = False,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -978,34 +977,20 @@ class Block(nn.Module):
             attn_gate_enabled=attn_gate_enabled,
         )
         self.mlp = MLP(dim, mlp_mult)
-        if osp_lite_enabled:
-            self.attn_scale = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
-            self.mlp_scale = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
-            self.resid_mix = nn.Parameter(torch.tensor([1.0, 0.0], dtype=torch.float32))
-            self.layer_scale = nn.Parameter(torch.tensor(layer_scale_init, dtype=torch.float32))
-        else:
-            self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-            self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-            self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
-            self.layer_scale = nn.Parameter(torch.full((dim,), layer_scale_init, dtype=torch.float32))
+        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        self.layer_scale = nn.Parameter(torch.full((dim,), layer_scale_init, dtype=torch.float32))
         self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
         self.parallel = False
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
-        if mix.ndim == 1 and mix.numel() == 2:
-            x_in = mix[0] * x + mix[1] * x0
-        else:
-            x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x_in) * self.ln_scale_factor)
-        ls = self.layer_scale.to(dtype=x_in.dtype)
-        if ls.ndim == 0:
-            attn_scale = self.attn_scale.to(dtype=x_in.dtype)
-            mlp_scale = self.mlp_scale.to(dtype=x_in.dtype)
-        else:
-            ls = ls[None, None, :]
-            attn_scale = self.attn_scale.to(dtype=x_in.dtype)[None, None, :]
-            mlp_scale = self.mlp_scale.to(dtype=x_in.dtype)[None, None, :]
+        ls = self.layer_scale.to(dtype=x_in.dtype)[None, None, :]
+        attn_scale = self.attn_scale.to(dtype=x_in.dtype)[None, None, :]
+        mlp_scale = self.mlp_scale.to(dtype=x_in.dtype)[None, None, :]
         if self.parallel:
             mlp_out = self.mlp(self.mlp_norm(x_in) * self.ln_scale_factor)
             x_out = x_in + ls * (attn_scale * attn_out + mlp_scale * mlp_out)
@@ -1031,18 +1016,13 @@ class GPT(nn.Module):
         self.blocks = nn.ModuleList([
             Block(h.model_dim, h.num_heads, h.num_kv_heads, h.mlp_mult, h.rope_base,
                   h.qk_gain_init, h.train_seq_len, h.rope_dims, layer_idx=i, ln_scale=h.ln_scale,
-                  attn_gate_enabled=h.attn_gate_enabled, layer_scale_init=h.layer_scale_init,
-                  osp_lite_enabled=h.osp_lite_enabled)
+                  attn_gate_enabled=h.attn_gate_enabled, layer_scale_init=h.layer_scale_init)
             for i in range(h.num_layers)
         ])
         # Skip weights + optional skip gates (PR #1493).
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-        if h.osp_lite_enabled:
-            self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, dtype=torch.float32))
-            self.skip_gates = nn.Parameter(torch.zeros(self.num_skip_weights, dtype=torch.float32)) if h.skip_gates_enabled else None
-        else:
-            self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, h.model_dim, dtype=torch.float32))
-            self.skip_gates = nn.Parameter(torch.zeros(self.num_skip_weights, h.model_dim, dtype=torch.float32)) if h.skip_gates_enabled else None
+        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, h.model_dim, dtype=torch.float32))
+        self.skip_gates = nn.Parameter(torch.zeros(self.num_skip_weights, h.model_dim, dtype=torch.float32)) if h.skip_gates_enabled else None
         self.final_norm = RMSNorm()
         self.lm_head = None if h.tie_embeddings else CastedLinear(h.embedding_dim, h.vocab_size, bias=False)
         if self.lm_head is not None:
@@ -1101,14 +1081,9 @@ class GPT(nn.Module):
             skips.append(x)
         for skip_idx, i in enumerate(dec_iter):
             if skip_idx < self.num_skip_weights and skips:
-                skip_weight = self.skip_weights[skip_idx].to(dtype=x.dtype)
-                if skip_weight.ndim == 0:
-                    scaled_skip = skip_weight * skips.pop()
-                else:
-                    scaled_skip = skip_weight[None, None, :] * skips.pop()
+                scaled_skip = self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :] * skips.pop()
                 if self.skip_gates is not None:
-                    gate = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=x.dtype))
-                    g = gate if gate.ndim == 0 else gate[None, None, :]
+                    g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=x.dtype))[None, None, :]
                     x = torch.lerp(scaled_skip, x, g)
                 else:
                     x = x + scaled_skip
