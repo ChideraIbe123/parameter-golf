@@ -113,7 +113,7 @@ class Hyperparameters:
     compressor = os.environ.get("COMPRESSOR", "brotli")
 
     # EMA.
-    ema_decay = float(os.environ.get("EMA_DECAY", 0.9965))
+    ema_decay = float(os.environ.get("EMA_DECAY", 0.0))
 
     # Optimizer hyperparameters (tuned per PR #1493).
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
