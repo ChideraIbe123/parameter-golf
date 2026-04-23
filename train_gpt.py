@@ -78,10 +78,12 @@ class Hyperparameters:
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 5.25))
 
     # Model shape.
+    osp_lite_enabled = bool(int(os.environ.get("OSP_LITE_ENABLED", "1")))
     vocab_size = int(os.environ.get("VOCAB_SIZE", DEFAULT_VOCAB_SIZE))
     num_layers = int(os.environ.get("NUM_LAYERS", 11))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
+    embedding_dim = int(os.environ.get("EMBEDDING_DIM", str(max((3 * model_dim) // 4, 256) if osp_lite_enabled else model_dim)))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 4))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
@@ -128,7 +130,7 @@ class Hyperparameters:
     compressor = os.environ.get("COMPRESSOR", "brotli")
 
     # EMA.
-    ema_decay = float(os.environ.get("EMA_DECAY", 0.9965))
+    ema_decay = float(os.environ.get("EMA_DECAY", "0.0" if osp_lite_enabled else "0.9965"))
 
     # Experimental features stay opt-in so default behavior tracks the strongest merged recipe.
     attn_gate_enabled = bool(int(os.environ.get("ATTN_GATE_ENABLED", "0")))
@@ -529,7 +531,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
 )
 
 def classify_param(name):
-    if "tok_emb" in name or "lm_head" in name:
+    if "tok_emb" in name or "lm_head" in name or "embed_proj" in name or "head_proj" in name:
         return "embed"
     if ".mlp." in name:
         return "mlp"
@@ -564,7 +566,8 @@ def collect_hessians(model, train_loader, args, device, n_calibration_batches=64
                     hessians[name] = torch.zeros(x.shape[1], x.shape[1], dtype=torch.float32, device=device)
                 hessians[name].addmm_(x.T, x)
             return hook_fn
-        hooks.append(model.final_norm.register_forward_hook(make_output_hook("tok_emb.weight")))
+        hook_module = model.head_proj if model.head_proj is not None else model.final_norm
+        hooks.append(hook_module.register_forward_hook(make_output_hook("tok_emb.weight")))
     model.eval()
     with torch.no_grad():
         for _ in range(n_calibration_batches):
@@ -959,6 +962,7 @@ class Block(nn.Module):
         ln_scale: bool = False,
         attn_gate_enabled: bool = False,
         layer_scale_init: float = 1.0,
+        osp_lite_enabled: bool = False,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -974,24 +978,40 @@ class Block(nn.Module):
             attn_gate_enabled=attn_gate_enabled,
         )
         self.mlp = MLP(dim, mlp_mult)
-        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        if osp_lite_enabled:
+            self.attn_scale = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+            self.mlp_scale = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+            self.resid_mix = nn.Parameter(torch.tensor([1.0, 0.0], dtype=torch.float32))
+            self.layer_scale = nn.Parameter(torch.tensor(layer_scale_init, dtype=torch.float32))
+        else:
+            self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+            self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+            self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+            self.layer_scale = nn.Parameter(torch.full((dim,), layer_scale_init, dtype=torch.float32))
         self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
         self.parallel = False
-        self.layer_scale = nn.Parameter(torch.full((dim,), layer_scale_init, dtype=torch.float32))
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
-        x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        if mix.ndim == 1 and mix.numel() == 2:
+            x_in = mix[0] * x + mix[1] * x0
+        else:
+            x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x_in) * self.ln_scale_factor)
-        ls = self.layer_scale.to(dtype=x_in.dtype)[None, None, :]
+        ls = self.layer_scale.to(dtype=x_in.dtype)
+        if ls.ndim == 0:
+            attn_scale = self.attn_scale.to(dtype=x_in.dtype)
+            mlp_scale = self.mlp_scale.to(dtype=x_in.dtype)
+        else:
+            ls = ls[None, None, :]
+            attn_scale = self.attn_scale.to(dtype=x_in.dtype)[None, None, :]
+            mlp_scale = self.mlp_scale.to(dtype=x_in.dtype)[None, None, :]
         if self.parallel:
             mlp_out = self.mlp(self.mlp_norm(x_in) * self.ln_scale_factor)
-            x_out = x_in + ls * (self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out + self.mlp_scale.to(dtype=x_in.dtype)[None, None, :] * mlp_out)
+            x_out = x_in + ls * (attn_scale * attn_out + mlp_scale * mlp_out)
         else:
-            x_out = x_in + ls * self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
-            x_out = x_out + ls * self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor)
+            x_out = x_in + ls * attn_scale * attn_out
+            x_out = x_out + ls * mlp_scale * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor)
         return x_out
 
 
@@ -1003,21 +1023,28 @@ class GPT(nn.Module):
         self.tie_embeddings = h.tie_embeddings
         self.tied_embed_init_std = h.tied_embed_init_std
         self.logit_softcap = h.logit_softcap
-        self.tok_emb = nn.Embedding(h.vocab_size, h.model_dim)
+        self.tok_emb = nn.Embedding(h.vocab_size, h.embedding_dim)
+        self.embed_proj = CastedLinear(h.embedding_dim, h.model_dim, bias=False) if h.embedding_dim != h.model_dim else None
+        self.head_proj = CastedLinear(h.model_dim, h.embedding_dim, bias=False) if h.embedding_dim != h.model_dim else None
         self.num_encoder_layers = h.num_layers // 2
         self.num_decoder_layers = h.num_layers - self.num_encoder_layers
         self.blocks = nn.ModuleList([
             Block(h.model_dim, h.num_heads, h.num_kv_heads, h.mlp_mult, h.rope_base,
                   h.qk_gain_init, h.train_seq_len, h.rope_dims, layer_idx=i, ln_scale=h.ln_scale,
-                  attn_gate_enabled=h.attn_gate_enabled, layer_scale_init=h.layer_scale_init)
+                  attn_gate_enabled=h.attn_gate_enabled, layer_scale_init=h.layer_scale_init,
+                  osp_lite_enabled=h.osp_lite_enabled)
             for i in range(h.num_layers)
         ])
         # Skip weights + optional skip gates (PR #1493).
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, h.model_dim, dtype=torch.float32))
-        self.skip_gates = nn.Parameter(torch.zeros(self.num_skip_weights, h.model_dim, dtype=torch.float32)) if h.skip_gates_enabled else None
+        if h.osp_lite_enabled:
+            self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, dtype=torch.float32))
+            self.skip_gates = nn.Parameter(torch.zeros(self.num_skip_weights, dtype=torch.float32)) if h.skip_gates_enabled else None
+        else:
+            self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, h.model_dim, dtype=torch.float32))
+            self.skip_gates = nn.Parameter(torch.zeros(self.num_skip_weights, h.model_dim, dtype=torch.float32)) if h.skip_gates_enabled else None
         self.final_norm = RMSNorm()
-        self.lm_head = None if h.tie_embeddings else CastedLinear(h.model_dim, h.vocab_size, bias=False)
+        self.lm_head = None if h.tie_embeddings else CastedLinear(h.embedding_dim, h.vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
 
@@ -1061,6 +1088,8 @@ class GPT(nn.Module):
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
+        if self.embed_proj is not None:
+            x = self.embed_proj(x)
         x0 = x
         skips: list[Tensor] = []
 
@@ -1072,15 +1101,22 @@ class GPT(nn.Module):
             skips.append(x)
         for skip_idx, i in enumerate(dec_iter):
             if skip_idx < self.num_skip_weights and skips:
-                scaled_skip = self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                skip_weight = self.skip_weights[skip_idx].to(dtype=x.dtype)
+                if skip_weight.ndim == 0:
+                    scaled_skip = skip_weight * skips.pop()
+                else:
+                    scaled_skip = skip_weight[None, None, :] * skips.pop()
                 if self.skip_gates is not None:
-                    g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=x.dtype))[None, None, :]
+                    gate = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=x.dtype))
+                    g = gate if gate.ndim == 0 else gate[None, None, :]
                     x = torch.lerp(scaled_skip, x, g)
                 else:
                     x = x + scaled_skip
             x = self.blocks[i](x, x0)
 
         x = self.final_norm(x)
+        if self.head_proj is not None:
+            x = self.head_proj(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
         else:
@@ -1205,14 +1241,25 @@ def main() -> None:
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
+    aux_named_params = []
+    if base_model.embed_proj is not None:
+        aux_named_params.extend([
+            ("embed_proj.weight", base_model.embed_proj.weight),
+            *((f"embed_proj.{n}", p) for n, p in base_model.embed_proj.named_parameters(recurse=False) if n != "weight"),
+        ])
+    if base_model.head_proj is not None:
+        aux_named_params.extend([
+            ("head_proj.weight", base_model.head_proj.weight),
+            *((f"head_proj.{n}", p) for n, p in base_model.head_proj.named_parameters(recurse=False) if n != "weight"),
+        ])
     matrix_params = [
         p
-        for name, p in block_named_params
+        for name, p in block_named_params + aux_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     scalar_params = [
         p
-        for name, p in block_named_params
+        for name, p in block_named_params + aux_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     if base_model.skip_weights.numel() > 0:
