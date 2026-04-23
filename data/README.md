@@ -15,6 +15,7 @@ Download the cached FineWeb export for a tokenizer variant with:
 
 ```bash
 python3 data/cached_challenge_fineweb.py --variant sp1024
+python3 data/cached_challenge_fineweb.py --variant sp8192
 ```
 
 This populates `./data/datasets/fineweb10B_sp1024/` and `./data/tokenizers/`.

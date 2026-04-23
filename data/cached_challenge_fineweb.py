@@ -5,6 +5,7 @@ import shutil
 from pathlib import Path
 
 from huggingface_hub import hf_hub_download
+from huggingface_hub.errors import EntryNotFoundError
 
 
 REPO_ID = os.environ.get("MATCHED_FINEWEB_REPO_ID", "willdepueoai/parameter-golf")
@@ -32,22 +33,27 @@ def local_path_for_remote(relative_path: str) -> Path:
     return ROOT / remote_path
 
 
-def get(relative_path: str) -> None:
+def get(relative_path: str, *, strict: bool = True) -> bool:
     destination = local_path_for_remote(relative_path)
     if destination.exists():
-        return
+        return True
     if destination.is_symlink():
         destination.unlink()
 
     remote_path = Path(relative_path)
-    cached_path = Path(
-        hf_hub_download(
-            repo_id=REPO_ID,
-            filename=remote_path.name,
-            subfolder=remote_path.parent.as_posix() if remote_path.parent != Path(".") else None,
-            repo_type="dataset",
+    try:
+        cached_path = Path(
+            hf_hub_download(
+                repo_id=REPO_ID,
+                filename=remote_path.name,
+                subfolder=remote_path.parent.as_posix() if remote_path.parent != Path(".") else None,
+                repo_type="dataset",
+            )
         )
-    )
+    except EntryNotFoundError:
+        if not strict:
+            return False
+        raise
     # HF cache entries may be snapshot symlinks. Resolve to the underlying blob so we
     # always materialize a real file in data/, not a broken relative symlink.
     cached_source = cached_path.resolve(strict=True)
@@ -56,6 +62,7 @@ def get(relative_path: str) -> None:
         os.link(cached_source, destination)
     except OSError:
         shutil.copy2(cached_source, destination)
+    return True
 
 
 def manifest_path() -> Path:
@@ -82,6 +89,30 @@ def artifact_paths_for_tokenizer(tokenizer_entry: dict) -> list[str]:
     if not artifacts:
         raise ValueError(f"tokenizer entry is missing downloadable artifacts: {tokenizer_entry}")
     return artifacts
+
+
+def fallback_tokenizer_artifacts_for_variant(variant: str) -> list[str] | None:
+    if variant == "byte260":
+        return None
+    if variant.startswith("sp") and variant[2:].isdigit():
+        vocab_size = variant[2:]
+        return [
+            f"tokenizers/fineweb_{vocab_size}_bpe.model",
+            f"tokenizers/fineweb_{vocab_size}_bpe.vocab",
+        ]
+    return None
+
+
+def download_full_validation_split(dataset_prefix: str) -> int:
+    val_shards = 0
+    while get(f"{dataset_prefix}/fineweb_val_{val_shards:06d}.bin", strict=False):
+        val_shards += 1
+    if val_shards == 0:
+        raise ValueError(
+            f"Could not find any validation shards under {dataset_prefix}. "
+            f"If this variant is new, update {REMOTE_ROOT_PREFIX}/manifest.json or publish the files first."
+        )
+    return val_shards
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -126,31 +157,44 @@ def main() -> None:
 
     manifest = load_manifest(skip_manifest_download=args.skip_manifest)
     dataset_entry = next((x for x in manifest.get("datasets", []) if x.get("name") == dataset_dir), None)
+    dataset_prefix = f"{REMOTE_ROOT_PREFIX}/datasets/{dataset_dir}"
+    tokenizer_artifacts: list[str] | None = None
     if dataset_entry is None:
-        raise ValueError(f"dataset {dataset_dir} not found in {REMOTE_ROOT_PREFIX}/manifest.json")
-    max_train_shards = int((dataset_entry.get("stats") or {}).get("files_train"))
-    val_shards = int((dataset_entry.get("stats") or {}).get("files_val"))
-    if train_shards > max_train_shards:
-        raise ValueError(
-            f"{args.variant} only has {max_train_shards} training shards on {REPO_ID}, requested {train_shards}"
-        )
-    tokenizer_name = dataset_entry.get("tokenizer_name")
-    tokenizer_entry = next((x for x in manifest.get("tokenizers", []) if x.get("name") == tokenizer_name), None)
-    if tokenizer_entry is None:
-        raise ValueError(f"tokenizer {tokenizer_name} not found in {REMOTE_ROOT_PREFIX}/manifest.json")
+        tokenizer_artifacts = fallback_tokenizer_artifacts_for_variant(args.variant)
+        if tokenizer_artifacts is None:
+            raise ValueError(f"dataset {dataset_dir} not found in {REMOTE_ROOT_PREFIX}/manifest.json")
+        val_shards = download_full_validation_split(dataset_prefix)
+    else:
+        max_train_shards = int((dataset_entry.get("stats") or {}).get("files_train"))
+        val_shards = int((dataset_entry.get("stats") or {}).get("files_val"))
+        if train_shards > max_train_shards:
+            raise ValueError(
+                f"{args.variant} only has {max_train_shards} training shards on {REPO_ID}, requested {train_shards}"
+            )
+        tokenizer_name = dataset_entry.get("tokenizer_name")
+        tokenizer_entry = next((x for x in manifest.get("tokenizers", []) if x.get("name") == tokenizer_name), None)
+        if tokenizer_entry is None:
+            raise ValueError(f"tokenizer {tokenizer_name} not found in {REMOTE_ROOT_PREFIX}/manifest.json")
+        tokenizer_artifacts = artifact_paths_for_tokenizer(tokenizer_entry)
 
     if args.with_docs:
         get(f"{REMOTE_ROOT_PREFIX}/docs_selected.jsonl")
         get(f"{REMOTE_ROOT_PREFIX}/docs_selected.source_manifest.json")
 
-    dataset_prefix = f"{REMOTE_ROOT_PREFIX}/datasets/{dataset_dir}"
     for i in range(val_shards):
         get(f"{dataset_prefix}/fineweb_val_{i:06d}.bin")
     for i in range(train_shards):
-        get(f"{dataset_prefix}/fineweb_train_{i:06d}.bin")
+        if not get(f"{dataset_prefix}/fineweb_train_{i:06d}.bin", strict=False):
+            raise ValueError(
+                f"{args.variant} has fewer than {train_shards} published training shards on {REPO_ID}; "
+                f"missing shard index {i}"
+            )
 
-    for artifact_path in artifact_paths_for_tokenizer(tokenizer_entry):
-        get(f"{REMOTE_ROOT_PREFIX}/{artifact_path}")
+    for artifact_path in tokenizer_artifacts:
+        if not get(f"{REMOTE_ROOT_PREFIX}/{artifact_path}", strict=False):
+            raise ValueError(
+                f"Tokenizer artifact {artifact_path} for variant {args.variant} was not found on {REPO_ID}"
+            )
 
 
 if __name__ == "__main__":
