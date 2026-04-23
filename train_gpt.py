@@ -554,7 +554,7 @@ def collect_hessians(model, train_loader, args, device, n_calibration_batches=64
     for name, module in model.named_modules():
         if isinstance(module, CastedLinear) and module.weight.numel() > 65536:
             cat = classify_param(name + ".weight")
-            if cat in ("mlp", "attn"):
+            if cat in ("mlp", "attn", "embed"):
                 hooks.append(module.register_forward_hook(make_hook(name + ".weight")))
     if model.tie_embeddings:
         def make_output_hook(name):
@@ -624,6 +624,10 @@ def gptq_mixed_quantize(state_dict, hessians, args):
         if not t.is_floating_point() or t.numel() <= 65536:
             result[name] = t.to(torch.float16) if t.is_floating_point() else t
             meta[name] = "passthrough (float16)"
+            continue
+        if name not in hessians:
+            result[name] = t.to(torch.float16)
+            meta[name] = "passthrough (missing hessian)"
             continue
         cs = args.embed_clip_sigmas if "tok_emb" in name else args.matrix_clip_sigmas
         bits = args.embed_bits if "tok_emb" in name else args.matrix_bits
