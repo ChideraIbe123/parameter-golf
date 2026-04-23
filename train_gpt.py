@@ -108,7 +108,7 @@ class Hyperparameters:
     gptq_calibration_batches = int(os.environ.get("GPTQ_CALIBRATION_BATCHES", 64))
     matrix_bits = int(os.environ.get("MATRIX_BITS", 6))
     embed_bits = int(os.environ.get("EMBED_BITS", 8))
-    matrix_clip_sigmas = float(os.environ.get("MATRIX_CLIP_SIGMAS", 6.0))
+    matrix_clip_sigmas = float(os.environ.get("MATRIX_CLIP_SIGMAS", 12.85))
     embed_clip_sigmas = float(os.environ.get("EMBED_CLIP_SIGMAS", 20.0))
     compressor = os.environ.get("COMPRESSOR", "brotli")
 
@@ -375,8 +375,8 @@ def eval_val_sliding(args, rank, world_size, device, val_tokens, base_model, bas
     return val_loss, bpb
 
 
-def eval_val_ttt(args, rank, world_size, device, val_tokens, base_model, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut, batch_seqs=32):
-    """Multi-Phase Score-first TTT: run multiple passes with decaying LR. Only last phase scores count."""
+def eval_val_ttt(args, rank, world_size, device, val_tokens, base_model, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut, batch_seqs=32, quant_error_per_layer=None):
+    """Multi-Phase Score-first TTT with adaptive per-layer LR (novel: layers with more quant error get higher LR)."""
     seq_len = args.eval_seq_len
     stride = args.eval_stride
     total_tokens = val_tokens.numel() - 1
@@ -391,11 +391,20 @@ def eval_val_ttt(args, rank, world_size, device, val_tokens, base_model, base_by
         scored_start = ws + s
         ci = min(scored_start // ttt_chunk, num_chunks - 1)
         chunk_windows[ci].append(ws)
-    ttt_params = [p for p in base_model.parameters()]
-    for p in ttt_params:
-        p.requires_grad_(True)
-    phase_lr = args.ttt_lr
-    optimizer = torch.optim.SGD(ttt_params, lr=phase_lr, momentum=args.ttt_momentum)
+    # Build per-parameter-group optimizer with adaptive LR based on quantization error.
+    param_groups = []
+    if quant_error_per_layer:
+        mean_err = sum(quant_error_per_layer.values()) / max(len(quant_error_per_layer), 1)
+        for name, p in base_model.named_parameters():
+            p.requires_grad_(True)
+            err = quant_error_per_layer.get(name, 0.0)
+            lr_scale = max(err / max(mean_err, 1e-10), 0.1) if mean_err > 0 else 1.0
+            param_groups.append({"params": [p], "lr": args.ttt_lr * lr_scale, "base_lr_scale": lr_scale})
+    else:
+        for p in base_model.parameters():
+            p.requires_grad_(True)
+            param_groups.append({"params": [p], "lr": args.ttt_lr, "base_lr_scale": 1.0})
+    optimizer = torch.optim.SGD(param_groups, lr=args.ttt_lr, momentum=args.ttt_momentum)
     # Multi-phase: run full TTT pass multiple times with decaying LR.
     for phase in range(args.ttt_phases):
         is_last_phase = phase == args.ttt_phases - 1
@@ -451,7 +460,7 @@ def eval_val_ttt(args, rank, world_size, device, val_tokens, base_model, base_by
             if chunk_seqs > 0:
                 cos_lr = args.ttt_lr * 0.5 * (1.0 + math.cos(math.pi * ci / max(num_chunks - 1, 1)))
                 for pg in optimizer.param_groups:
-                    pg["lr"] = cos_lr
+                    pg["lr"] = cos_lr * pg.get("base_lr_scale", 1.0)
                 my_seq_s = chunk_seqs * rank // world_size
                 my_seq_e = chunk_seqs * (rank + 1) // world_size
                 my_chunk_seqs = my_seq_e - my_seq_s
@@ -470,10 +479,10 @@ def eval_val_ttt(args, rank, world_size, device, val_tokens, base_model, base_by
                             loss = base_model(x, y)
                         loss.backward()
                         if world_size > 1:
-                            for p in ttt_params:
+                            for p in base_model.parameters():
                                 if p.grad is not None:
                                     dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
-                        torch.nn.utils.clip_grad_norm_(ttt_params, 1.0)
+                        torch.nn.utils.clip_grad_norm_(base_model.parameters(), 1.0)
                         optimizer.step()
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
@@ -1425,6 +1434,23 @@ def main() -> None:
     quant_file_bytes = len(quant_blob)
     code_bytes = len(code.encode("utf-8"))
     bytes_total = quant_file_bytes + code_bytes
+    # Compute per-layer quantization error for adaptive TTT LR (novel technique).
+    quant_error_per_layer = {}
+    for name, orig_tensor in sd_cpu.items():
+        info = quant_meta.get(name)
+        if info is None or "passthrough" in info:
+            continue
+        q, s = quant_result[name + ".q"], quant_result[name + ".scale"]
+        if s.ndim > 0:
+            deq = (q.float() * s.float().view(q.shape[0], *[1] * (q.ndim - 1)))
+        else:
+            deq = q.float() * float(s.item())
+        mse = (orig_tensor.float() - deq).pow(2).mean().item()
+        quant_error_per_layer[name] = mse
+    if quant_error_per_layer:
+        mean_err = sum(quant_error_per_layer.values()) / len(quant_error_per_layer)
+        log0(f"GPTQ:per-layer quant error: mean={mean_err:.6f} max={max(quant_error_per_layer.values()):.6f} min={min(quant_error_per_layer.values()):.6f}")
+
     if master_process:
         with open("final_model.gptq.ptz", "wb") as f:
             f.write(quant_blob)
@@ -1468,7 +1494,7 @@ def main() -> None:
         base_model.load_state_dict(deq_state_fresh, strict=True)
         torch.cuda.synchronize()
         t_ttt = time.perf_counter()
-        ttt_loss, ttt_bpb = eval_val_ttt(args, rank, world_size, device, val_tokens, base_model, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut)
+        ttt_loss, ttt_bpb = eval_val_ttt(args, rank, world_size, device, val_tokens, base_model, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut, quant_error_per_layer=quant_error_per_layer)
         torch.cuda.synchronize()
         log0(f"ttt val_loss:{ttt_loss:.8f} val_bpb:{ttt_bpb:.8f} eval_time:{1000.0 * (time.perf_counter() - t_ttt):.0f}ms")
 
