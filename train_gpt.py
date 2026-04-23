@@ -33,18 +33,32 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
-# Default Simple Baseline run:
-# - 9 transformer blocks at width 512
-# - 8 attention heads with 4 KV heads (GQA) and 2x MLP expansion
-# - vocab size 1024, sequence length 1024, tied embeddings
-# - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
+# Default record-chasing run:
+# - 11 transformer blocks at width 512
+# - 8 attention heads with 4 KV heads (GQA) and 4x MLP expansion
+# - SP8192 vocab, sequence length 2048, tied embeddings
+# - depth recurrence + parallel residuals + score-first TTT + GPTQ SDClip
+# - tuned to stay within the 10-minute / 16MB competition budget
+
+def _detect_default_tokenizer_setup() -> tuple[str, str, int]:
+    candidates = (
+        ("./data/datasets/fineweb10B_sp8192", "./data/tokenizers/fineweb_8192_bpe.model", 8192),
+        ("./data/datasets/fineweb10B_sp1024", "./data/tokenizers/fineweb_1024_bpe.model", 1024),
+    )
+    for data_path, tokenizer_path, vocab_size in candidates:
+        if Path(data_path).exists() and Path(tokenizer_path).exists():
+            return data_path, tokenizer_path, vocab_size
+    return candidates[0]
+
+
+DEFAULT_DATA_PATH, DEFAULT_TOKENIZER_PATH, DEFAULT_VOCAB_SIZE = _detect_default_tokenizer_setup()
 
 class Hyperparameters:
     # Data paths are shard globs produced by the existing preprocessing pipeline.
-    data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
+    data_path = os.environ.get("DATA_PATH", DEFAULT_DATA_PATH)
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
-    tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
+    tokenizer_path = os.environ.get("TOKENIZER_PATH", DEFAULT_TOKENIZER_PATH)
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
     seed = int(os.environ.get("SEED", 1337))
 
@@ -64,7 +78,7 @@ class Hyperparameters:
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 5.25))
 
     # Model shape.
-    vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
+    vocab_size = int(os.environ.get("VOCAB_SIZE", DEFAULT_VOCAB_SIZE))
     num_layers = int(os.environ.get("NUM_LAYERS", 11))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
@@ -85,8 +99,8 @@ class Hyperparameters:
     # Parallel residuals (PR #1412/#1493).
     parallel_residual_start = int(os.environ.get("PARALLEL_RESIDUAL_START", 7))
 
-    # XSA (PR #1019/#1493).
-    xsa_last_n = int(os.environ.get("XSA_LAST_N", 11))
+    # XSA is not part of the current merged SP8192 record stack; keep it opt-in.
+    xsa_last_n = int(os.environ.get("XSA_LAST_N", 0))
 
     # Skip gates.
     skip_gates_enabled = bool(int(os.environ.get("SKIP_GATES_ENABLED", "1")))
@@ -95,14 +109,15 @@ class Hyperparameters:
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
     sliding_window_enabled = bool(int(os.environ.get("SLIDING_WINDOW_ENABLED", "0")))
 
-    # Score-first Multi-Phase TTT (novel: multiple passes with LR decay).
+    # Score-first TTT. Keep single-pass semantics for Issue #1017 compliance.
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
     ttt_lr = float(os.environ.get("TTT_LR", 0.005))
-    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 2))
+    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 3))
     ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.9))
     ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", 32768))
     ttt_phases = int(os.environ.get("TTT_PHASES", 1))
     ttt_lr_decay = float(os.environ.get("TTT_LR_DECAY", 0.5))
+    ttt_adaptive_lr = bool(int(os.environ.get("TTT_ADAPTIVE_LR", "0")))
 
     # GPTQ SDClip quantization (PR #1394).
     gptq_calibration_batches = int(os.environ.get("GPTQ_CALIBRATION_BATCHES", 64))
@@ -113,7 +128,11 @@ class Hyperparameters:
     compressor = os.environ.get("COMPRESSOR", "brotli")
 
     # EMA.
-    ema_decay = float(os.environ.get("EMA_DECAY", 0.0))
+    ema_decay = float(os.environ.get("EMA_DECAY", 0.9965))
+
+    # Experimental features stay opt-in so default behavior tracks the strongest merged recipe.
+    attn_gate_enabled = bool(int(os.environ.get("ATTN_GATE_ENABLED", "0")))
+    layer_scale_init = float(os.environ.get("LAYER_SCALE_INIT", 1.0))
 
     # Optimizer hyperparameters (tuned per PR #1493).
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -379,7 +398,12 @@ def eval_val_sliding(args, rank, world_size, device, val_tokens, base_model, bas
 
 
 def eval_val_ttt(args, rank, world_size, device, val_tokens, base_model, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut, batch_seqs=32, quant_error_per_layer=None):
-    """Multi-Phase Score-first TTT with adaptive per-layer LR (novel: layers with more quant error get higher LR)."""
+    """Single-pass score-first TTT that scores each token exactly once before any update."""
+    if args.ttt_phases != 1:
+        raise ValueError(
+            "TTT_PHASES>1 is disabled: rescoring validation tokens across phases would risk "
+            "violating the Issue #1017 single-pass rule."
+        )
     seq_len = args.eval_seq_len
     stride = args.eval_stride
     total_tokens = val_tokens.numel() - 1
@@ -394,9 +418,9 @@ def eval_val_ttt(args, rank, world_size, device, val_tokens, base_model, base_by
         scored_start = ws + s
         ci = min(scored_start // ttt_chunk, num_chunks - 1)
         chunk_windows[ci].append(ws)
-    # Build per-parameter-group optimizer with adaptive LR based on quantization error.
+    # Optional per-parameter-group LR scaling based on quantization error.
     param_groups = []
-    if quant_error_per_layer:
+    if args.ttt_adaptive_lr and quant_error_per_layer:
         mean_err = sum(quant_error_per_layer.values()) / max(len(quant_error_per_layer), 1)
         for name, p in base_model.named_parameters():
             p.requires_grad_(True)
@@ -408,15 +432,9 @@ def eval_val_ttt(args, rank, world_size, device, val_tokens, base_model, base_by
             p.requires_grad_(True)
             param_groups.append({"params": [p], "lr": args.ttt_lr, "base_lr_scale": 1.0})
     optimizer = torch.optim.SGD(param_groups, lr=args.ttt_lr, momentum=args.ttt_momentum)
-    # Multi-phase: run full TTT pass multiple times with decaying LR.
-    for phase in range(args.ttt_phases):
-        is_last_phase = phase == args.ttt_phases - 1
-        phase_lr = args.ttt_lr * (args.ttt_lr_decay ** phase)
-        for pg in optimizer.param_groups:
-            pg["lr"] = phase_lr
-        loss_sum = torch.zeros((), device=device, dtype=torch.float64)
-        token_count = torch.zeros((), device=device, dtype=torch.float64)
-        byte_count = torch.zeros((), device=device, dtype=torch.float64)
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    token_count = torch.zeros((), device=device, dtype=torch.float64)
+    byte_count = torch.zeros((), device=device, dtype=torch.float64)
     for ci in range(num_chunks):
         windows = chunk_windows[ci]
         if not windows:
@@ -840,7 +858,17 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor, rope_dims: int = 0) ->
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float, qk_gain_init: float, train_seq_len: int = 2048, rope_dims: int = 0):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        num_kv_heads: int,
+        rope_base: float,
+        qk_gain_init: float,
+        train_seq_len: int = 2048,
+        rope_dims: int = 0,
+        attn_gate_enabled: bool = False,
+    ):
         super().__init__()
         if dim % num_heads != 0:
             raise ValueError("model_dim must be divisible by num_heads")
@@ -861,12 +889,11 @@ class CausalSelfAttention(nn.Module):
         self.rope_dims = rope_dims
         self.rotary = Rotary(self.head_dim, base=rope_base, train_seq_len=train_seq_len, rope_dims=rope_dims if rope_dims > 0 else self.head_dim)
         self.use_xsa = False
-        # Novel: Gated Attention Output (NeurIPS 2025 Best Paper / Qwen3-Next).
-        # Query-dependent per-head sigmoid gate after SDPA. Creates sparse gating
-        # that lets heads "shut off" when uninformative.
-        self.attn_gate = CastedLinear(dim, num_heads, bias=True)
-        nn.init.zeros_(self.attn_gate.weight)
-        nn.init.ones_(self.attn_gate.bias)
+        self.attn_gate = None
+        if attn_gate_enabled:
+            self.attn_gate = CastedLinear(dim, num_heads, bias=True)
+            nn.init.zeros_(self.attn_gate.weight)
+            nn.init.ones_(self.attn_gate.bias)
 
     def _xsa_efficient(self, y, v):
         B, T, H, D = y.shape
@@ -896,9 +923,9 @@ class CausalSelfAttention(nn.Module):
             vh = vh.repeat_interleave(rep, dim=1)
         y = F.scaled_dot_product_attention(qh, kh, vh, is_causal=True)
         y = y.transpose(1, 2).contiguous()  # (B, T, H, D)
-        # Gated Attention: query-dependent per-head gate
-        gate = torch.sigmoid(self.attn_gate(x)).unsqueeze(-1)  # (B, T, H, 1)
-        y = y * gate
+        if self.attn_gate is not None:
+            gate = torch.sigmoid(self.attn_gate(x)).unsqueeze(-1)
+            y = y * gate
         if self.use_xsa:
             y = self._xsa_efficient(y, v)
         y = y.reshape(bsz, seqlen, dim)
@@ -918,21 +945,41 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int, rope_base: float, qk_gain_init: float, train_seq_len: int = 2048, rope_dims: int = 0, layer_idx: int = 0, ln_scale: bool = False):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        num_kv_heads: int,
+        mlp_mult: int,
+        rope_base: float,
+        qk_gain_init: float,
+        train_seq_len: int = 2048,
+        rope_dims: int = 0,
+        layer_idx: int = 0,
+        ln_scale: bool = False,
+        attn_gate_enabled: bool = False,
+        layer_scale_init: float = 1.0,
+    ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, train_seq_len, rope_dims)
+        self.attn = CausalSelfAttention(
+            dim,
+            num_heads,
+            num_kv_heads,
+            rope_base,
+            qk_gain_init,
+            train_seq_len,
+            rope_dims,
+            attn_gate_enabled=attn_gate_enabled,
+        )
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
         self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
         self.parallel = False
-        # Novel: LayerScale for depth recurrence stabilization (arXiv:2603.21676).
-        # Initializes recurrence residual at 0.1 instead of 1.0, preventing gradient
-        # explosion through deep recurrence loops. Learns to increase during training.
-        self.layer_scale = nn.Parameter(torch.full((dim,), 0.1, dtype=torch.float32))
+        self.layer_scale = nn.Parameter(torch.full((dim,), layer_scale_init, dtype=torch.float32))
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
@@ -961,7 +1008,8 @@ class GPT(nn.Module):
         self.num_decoder_layers = h.num_layers - self.num_encoder_layers
         self.blocks = nn.ModuleList([
             Block(h.model_dim, h.num_heads, h.num_kv_heads, h.mlp_mult, h.rope_base,
-                  h.qk_gain_init, h.train_seq_len, h.rope_dims, layer_idx=i, ln_scale=h.ln_scale)
+                  h.qk_gain_init, h.train_seq_len, h.rope_dims, layer_idx=i, ln_scale=h.ln_scale,
+                  attn_gate_enabled=h.attn_gate_enabled, layer_scale_init=h.layer_scale_init)
             for i in range(h.num_layers)
         ])
         # Skip weights + optional skip gates (PR #1493).
