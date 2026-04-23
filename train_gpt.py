@@ -95,12 +95,14 @@ class Hyperparameters:
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
     sliding_window_enabled = bool(int(os.environ.get("SLIDING_WINDOW_ENABLED", "0")))
 
-    # Score-first TTT (PR #1493).
+    # Score-first Multi-Phase TTT (novel: multiple passes with LR decay).
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
     ttt_lr = float(os.environ.get("TTT_LR", 0.005))
     ttt_epochs = int(os.environ.get("TTT_EPOCHS", 2))
     ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.9))
     ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", 32768))
+    ttt_phases = int(os.environ.get("TTT_PHASES", 1))
+    ttt_lr_decay = float(os.environ.get("TTT_LR_DECAY", 0.5))
 
     # GPTQ SDClip quantization (PR #1394).
     gptq_calibration_batches = int(os.environ.get("GPTQ_CALIBRATION_BATCHES", 64))
@@ -374,7 +376,7 @@ def eval_val_sliding(args, rank, world_size, device, val_tokens, base_model, bas
 
 
 def eval_val_ttt(args, rank, world_size, device, val_tokens, base_model, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut, batch_seqs=32):
-    """Score-first TTT: score each chunk under no_grad, then do SGD on already-scored tokens."""
+    """Multi-Phase Score-first TTT: run multiple passes with decaying LR. Only last phase scores count."""
     seq_len = args.eval_seq_len
     stride = args.eval_stride
     total_tokens = val_tokens.numel() - 1
@@ -389,13 +391,20 @@ def eval_val_ttt(args, rank, world_size, device, val_tokens, base_model, base_by
         scored_start = ws + s
         ci = min(scored_start // ttt_chunk, num_chunks - 1)
         chunk_windows[ci].append(ws)
-    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
-    token_count = torch.zeros((), device=device, dtype=torch.float64)
-    byte_count = torch.zeros((), device=device, dtype=torch.float64)
     ttt_params = [p for p in base_model.parameters()]
     for p in ttt_params:
         p.requires_grad_(True)
-    optimizer = torch.optim.SGD(ttt_params, lr=args.ttt_lr, momentum=args.ttt_momentum)
+    phase_lr = args.ttt_lr
+    optimizer = torch.optim.SGD(ttt_params, lr=phase_lr, momentum=args.ttt_momentum)
+    # Multi-phase: run full TTT pass multiple times with decaying LR.
+    for phase in range(args.ttt_phases):
+        is_last_phase = phase == args.ttt_phases - 1
+        phase_lr = args.ttt_lr * (args.ttt_lr_decay ** phase)
+        for pg in optimizer.param_groups:
+            pg["lr"] = phase_lr
+        loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+        token_count = torch.zeros((), device=device, dtype=torch.float64)
+        byte_count = torch.zeros((), device=device, dtype=torch.float64)
     for ci in range(num_chunks):
         windows = chunk_windows[ci]
         if not windows:
@@ -840,6 +849,12 @@ class CausalSelfAttention(nn.Module):
         self.rope_dims = rope_dims
         self.rotary = Rotary(self.head_dim, base=rope_base, train_seq_len=train_seq_len, rope_dims=rope_dims if rope_dims > 0 else self.head_dim)
         self.use_xsa = False
+        # Novel: Gated Attention Output (NeurIPS 2025 Best Paper / Qwen3-Next).
+        # Query-dependent per-head sigmoid gate after SDPA. Creates sparse gating
+        # that lets heads "shut off" when uninformative.
+        self.attn_gate = CastedLinear(dim, num_heads, bias=True)
+        nn.init.zeros_(self.attn_gate.weight)
+        nn.init.ones_(self.attn_gate.bias)
 
     def _xsa_efficient(self, y, v):
         B, T, H, D = y.shape
@@ -869,6 +884,9 @@ class CausalSelfAttention(nn.Module):
             vh = vh.repeat_interleave(rep, dim=1)
         y = F.scaled_dot_product_attention(qh, kh, vh, is_causal=True)
         y = y.transpose(1, 2).contiguous()  # (B, T, H, D)
+        # Gated Attention: query-dependent per-head gate
+        gate = torch.sigmoid(self.attn_gate(x)).unsqueeze(-1)  # (B, T, H, 1)
+        y = y * gate
         if self.use_xsa:
             y = self._xsa_efficient(y, v)
         y = y.reshape(bsz, seqlen, dim)
