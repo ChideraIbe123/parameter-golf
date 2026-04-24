@@ -164,6 +164,12 @@ class Hyperparameters:
     qat_lite_clip_sigmas = float(os.environ.get("QAT_LITE_CLIP_SIGMAS", 12.85))
     qat_lite_layer_start = int(os.environ.get("QAT_LITE_LAYER_START", 7))
     qat_lite_include_proj = bool(int(os.environ.get("QAT_LITE_INCLUDE_PROJ", "0")))
+    qact_lite_enabled = bool(int(os.environ.get("QACT_LITE_ENABLED", "0")))
+    qact_lite_start_frac = float(os.environ.get("QACT_LITE_START_FRAC", 0.55))
+    qact_lite_every = int(os.environ.get("QACT_LITE_EVERY", 4))
+    qact_lite_lambda = float(os.environ.get("QACT_LITE_LAMBDA", 0.002))
+    qact_lite_layer_start = int(os.environ.get("QACT_LITE_LAYER_START", 7))
+    qact_lite_tau = float(os.environ.get("QACT_LITE_TAU", 3.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -591,6 +597,29 @@ def compute_qat_lite_penalty(named_params: list[tuple[str, nn.Parameter]], args)
         quantized = fake_quantize_rowwise(param, args.qat_lite_bits, args.qat_lite_clip_sigmas).detach()
         penalty = penalty + F.mse_loss(param.float(), quantized.float(), reduction="mean")
     return penalty / len(named_params)
+
+def select_qact_lite_modules(model: nn.Module, args) -> list[tuple[str, nn.Module]]:
+    pattern = re.compile(r"blocks\.(\d+)\.attn\.(c_q|c_k)$")
+    selected = []
+    for name, module in model.named_modules():
+        match = pattern.search(name)
+        if match is None:
+            continue
+        if int(match.group(1)) < args.qact_lite_layer_start:
+            continue
+        selected.append((name, module))
+    return selected
+
+def compute_qact_lite_penalty(activations: dict[str, Tensor], args) -> Tensor:
+    if not activations:
+        raise ValueError("activations must be non-empty")
+    penalty = torch.zeros((), device=next(iter(activations.values())).device, dtype=torch.float32)
+    for act in activations.values():
+        a = act.float()
+        sigma = a.std(dim=-1, keepdim=True).clamp_min(1e-6)
+        tail = F.relu(a.abs() - args.qact_lite_tau * sigma)
+        penalty = penalty + tail.square().mean()
+    return penalty / len(activations)
 
 def collect_hessians(model, train_loader, args, device, n_calibration_batches=64):
     hessians = {}
@@ -1334,11 +1363,26 @@ def main() -> None:
     )
     qat_lite_named_params = select_qat_lite_params(base_model, args) if args.qat_lite_enabled else []
     qat_lite_start_step = int(args.iterations * args.qat_lite_start_frac)
+    qact_lite_activations: dict[str, Tensor] = {}
+    qact_lite_hooks: list[torch.utils.hooks.RemovableHandle] = []
+    qact_lite_modules = select_qact_lite_modules(base_model, args) if args.qact_lite_enabled else []
+    qact_lite_start_step = int(args.iterations * args.qact_lite_start_frac)
     if args.qat_lite_enabled:
         log0(
             f"qat_lite:enabled params:{len(qat_lite_named_params)} start_step:{qat_lite_start_step} "
             f"bits:{args.qat_lite_bits} clip_sigmas:{args.qat_lite_clip_sigmas} "
             f"every:{args.qat_lite_every} lambda:{args.qat_lite_lambda}"
+        )
+    if args.qact_lite_enabled:
+        for name, module in qact_lite_modules:
+            def make_hook(module_name):
+                def hook_fn(_module, _inp, out):
+                    qact_lite_activations[module_name] = out
+                return hook_fn
+            qact_lite_hooks.append(module.register_forward_hook(make_hook(name)))
+        log0(
+            f"qact_lite:enabled modules:{len(qact_lite_modules)} start_step:{qact_lite_start_step} "
+            f"every:{args.qact_lite_every} lambda:{args.qact_lite_lambda} tau:{args.qact_lite_tau}"
         )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1466,6 +1510,7 @@ def main() -> None:
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         qat_penalty_value = 0.0
+        qact_penalty_value = 0.0
         apply_qat_lite = (
             args.qat_lite_enabled
             and len(qat_lite_named_params) > 0
@@ -1473,10 +1518,19 @@ def main() -> None:
             and args.qat_lite_every > 0
             and step % args.qat_lite_every == 0
         )
+        apply_qact_lite = (
+            args.qact_lite_enabled
+            and len(qact_lite_modules) > 0
+            and step >= qact_lite_start_step
+            and args.qact_lite_every > 0
+            and step % args.qact_lite_every == 0
+        )
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            if apply_qact_lite:
+                qact_lite_activations.clear()
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
             train_loss += loss.detach()
@@ -1484,6 +1538,10 @@ def main() -> None:
                 qat_penalty = compute_qat_lite_penalty(qat_lite_named_params, args)
                 qat_penalty_value = float(qat_penalty.item())
                 loss = loss + (grad_accum_steps * args.qat_lite_lambda) * qat_penalty
+            if apply_qact_lite and micro_step == grad_accum_steps - 1 and len(qact_lite_activations) > 0:
+                qact_penalty = compute_qact_lite_penalty(qact_lite_activations, args)
+                qact_penalty_value = float(qact_penalty.item())
+                loss = loss + (grad_accum_steps * args.qact_lite_lambda) * qact_penalty
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
 
@@ -1529,6 +1587,7 @@ def main() -> None:
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
                 f"{f' qat_penalty:{qat_penalty_value:.6f}' if apply_qat_lite else ''}"
+                f"{f' qact_penalty:{qact_penalty_value:.6f}' if apply_qact_lite else ''}"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1544,6 +1603,8 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    for hook in qact_lite_hooks:
+        hook.remove()
 
     # Apply EMA weights before serialization/eval.
     if args.ema_decay > 0 and ema_state is not None:
