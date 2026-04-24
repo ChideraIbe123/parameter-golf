@@ -84,6 +84,28 @@ Interpretation:
 - confirms MuonEq-R was a materially missing record ingredient
 - still over the size cap, but now the branch is much more competitive on quality
 
+### Fraction-of-iterations scheduling bug
+
+Important follow-up discovery:
+
+- several training features were gated by `step / iterations`
+- the branch runs with `iterations=20000`, but wallclock cap stops training at only about `4860` steps
+- therefore any feature starting at fractions like `0.35` or `0.55` of `iterations` never actually activated under the 600s cap
+
+Affected features:
+
+- depth recurrence activation (`enable_looping_at=0.35`)
+- late-start EMA (`EMA_START_FRAC`)
+- QAT-lite start (`QAT_LITE_START_FRAC`)
+
+Consequence:
+
+- several earlier experiments were partially or completely placebo with respect to the intended late-stage behavior
+
+Fix applied:
+
+- when `MAX_WALLCLOCK_SECONDS` is active, fraction-gated features now use wallclock progress as well as nominal iteration progress
+
 ## Novel Technique Experiments
 
 ### 1. OSP-lite

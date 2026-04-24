@@ -1363,12 +1363,12 @@ def main() -> None:
     )
     ema_start_step = int(args.iterations * args.ema_start_frac)
     if args.ema_decay > 0:
-        log0(f"ema:enabled decay:{args.ema_decay} start_step:{ema_start_step}")
+        log0(f"ema:enabled decay:{args.ema_decay} start_frac:{args.ema_start_frac:.3f} nominal_step:{ema_start_step}")
     qat_lite_named_params = select_qat_lite_params(base_model, args) if args.qat_lite_enabled else []
     qat_lite_start_step = int(args.iterations * args.qat_lite_start_frac)
     if args.qat_lite_enabled:
         log0(
-            f"qat_lite:enabled params:{len(qat_lite_named_params)} start_step:{qat_lite_start_step} "
+            f"qat_lite:enabled params:{len(qat_lite_named_params)} start_frac:{args.qat_lite_start_frac:.3f} nominal_step:{qat_lite_start_step} "
             f"bits:{args.qat_lite_bits} clip_sigmas:{args.qat_lite_clip_sigmas} "
             f"every:{args.qat_lite_every} lambda:{args.qat_lite_lambda} ramp:linear "
             f"targets:{args.qat_lite_targets} penalty:{args.qat_lite_penalty} depth_power:{args.qat_lite_depth_power}"
@@ -1402,6 +1402,15 @@ def main() -> None:
         warmdown_ms = args.warmdown_frac * max_wallclock_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
+
+    def progress_frac(step: int, elapsed_ms: float) -> float:
+        iter_frac = step / max(args.iterations, 1)
+        if max_wallclock_ms is None:
+            return iter_frac
+        wallclock_frac = elapsed_ms / max(max_wallclock_ms, 1e-9)
+        return max(iter_frac, min(max(wallclock_frac, 0.0), 1.0))
+
+    ema_state = None
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
@@ -1496,17 +1505,18 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+        train_progress = progress_frac(step, elapsed_ms)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         qat_penalty_value = 0.0
         apply_qat_lite = (
             args.qat_lite_enabled
             and len(qat_lite_named_params) > 0
-            and step >= qat_lite_start_step
+            and train_progress >= args.qat_lite_start_frac
             and args.qat_lite_every > 0
             and step % args.qat_lite_every == 0
         )
-        qat_ramp = min(max((step - qat_lite_start_step + 1) / max(args.iterations - qat_lite_start_step, 1), 0.0), 1.0)
+        qat_ramp = min(max((train_progress - args.qat_lite_start_frac) / max(1.0 - args.qat_lite_start_frac, 1e-9), 0.0), 1.0)
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
@@ -1537,8 +1547,8 @@ def main() -> None:
         zero_grad_all()
 
         # EMA weight averaging (PR #1493).
-        if args.ema_decay > 0 and step >= ema_start_step:
-            if step == ema_start_step:
+        if args.ema_decay > 0 and train_progress >= args.ema_start_frac:
+            if ema_state is None:
                 ema_state = {k: v.clone() for k, v in base_model.state_dict().items()}
             else:
                 d = args.ema_decay
@@ -1547,10 +1557,9 @@ def main() -> None:
 
         # Depth recurrence activation (PR #1394/#1493).
         if args.num_loops > 0 and not base_model.looping_active:
-            frac = step / max(args.iterations, 1)
-            if frac >= args.enable_looping_at:
+            if train_progress >= args.enable_looping_at:
                 base_model.looping_active = True
-                log0(f"layer_loop:enabled step:{step} frac:{frac:.3f} encoder:{base_model.encoder_indices} decoder:{base_model.decoder_indices}")
+                log0(f"layer_loop:enabled step:{step} frac:{train_progress:.3f} encoder:{base_model.encoder_indices} decoder:{base_model.decoder_indices}")
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
