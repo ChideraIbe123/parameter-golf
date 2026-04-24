@@ -95,6 +95,8 @@ class Hyperparameters:
     loop_start = int(os.environ.get("LOOP_START", 3))
     loop_end = int(os.environ.get("LOOP_END", 5))
     enable_looping_at = float(os.environ.get("ENABLE_LOOPING_AT", 0.35))
+    recur_alpha_enabled = bool(int(os.environ.get("RECUR_ALPHA_ENABLED", "0")))
+    recur_alpha_init = float(os.environ.get("RECUR_ALPHA_INIT", 1.0))
 
     # Parallel residuals (PR #1412/#1493).
     parallel_residual_start = int(os.environ.get("PARALLEL_RESIDUAL_START", 7))
@@ -1129,6 +1131,9 @@ class GPT(nn.Module):
 
         # Depth recurrence indices (PR #1394/#1493).
         self.looping_active = False
+        self.recur_alpha = None
+        self.encoder_recur_alpha: list[int] = []
+        self.decoder_recur_alpha: list[int] = []
         if h.num_loops > 0:
             loop_seg = list(range(h.loop_start, h.loop_end + 1))
             all_indices = list(range(h.loop_start))
@@ -1138,9 +1143,27 @@ class GPT(nn.Module):
             num_enc = len(all_indices) // 2
             self.encoder_indices = all_indices[:num_enc]
             self.decoder_indices = all_indices[num_enc:]
+            if h.recur_alpha_enabled:
+                counts: dict[int, int] = collections.defaultdict(int)
+                recur_alpha_map: list[int] = []
+                recur_alpha_count = 0
+                for idx in all_indices:
+                    occ = counts[idx]
+                    if h.loop_start <= idx <= h.loop_end and occ > 0:
+                        recur_alpha_map.append(recur_alpha_count)
+                        recur_alpha_count += 1
+                    else:
+                        recur_alpha_map.append(-1)
+                    counts[idx] += 1
+                if recur_alpha_count > 0:
+                    self.recur_alpha = nn.Parameter(torch.full((recur_alpha_count,), h.recur_alpha_init, dtype=torch.float32))
+                self.encoder_recur_alpha = recur_alpha_map[:num_enc]
+                self.decoder_recur_alpha = recur_alpha_map[num_enc:]
         else:
             self.encoder_indices = list(range(self.num_encoder_layers))
             self.decoder_indices = list(range(self.num_encoder_layers, h.num_layers))
+            self.encoder_recur_alpha = [-1] * len(self.encoder_indices)
+            self.decoder_recur_alpha = [-1] * len(self.decoder_indices)
 
         self._init_weights()
 
@@ -1160,11 +1183,23 @@ class GPT(nn.Module):
         x0 = x
         skips: list[Tensor] = []
 
+        def apply_recur_alpha(x_in: Tensor, x_out: Tensor, alpha_idx: int) -> Tensor:
+            if self.recur_alpha is None or alpha_idx < 0:
+                return x_out
+            # Tiny learned gates on repeated loop visits let recurrence deviate from the
+            # first-pass block behavior without introducing a second set of block weights.
+            alpha = self.recur_alpha[alpha_idx].to(dtype=x_in.dtype)
+            return x_in + alpha * (x_out - x_in)
+
         enc_iter = self.encoder_indices if self.looping_active else range(self.num_encoder_layers)
         dec_iter = self.decoder_indices if self.looping_active else range(self.num_encoder_layers, self.num_encoder_layers + self.num_decoder_layers)
 
-        for i in enc_iter:
-            x = self.blocks[i](x, x0)
+        for pos, i in enumerate(enc_iter):
+            x = apply_recur_alpha(
+                x,
+                self.blocks[i](x, x0),
+                self.encoder_recur_alpha[pos] if self.looping_active and self.encoder_recur_alpha else -1,
+            )
             skips.append(x)
         for skip_idx, i in enumerate(dec_iter):
             if skip_idx < self.num_skip_weights and skips:
@@ -1174,7 +1209,11 @@ class GPT(nn.Module):
                     x = torch.lerp(scaled_skip, x, g)
                 else:
                     x = x + scaled_skip
-            x = self.blocks[i](x, x0)
+            x = apply_recur_alpha(
+                x,
+                self.blocks[i](x, x0),
+                self.decoder_recur_alpha[skip_idx] if self.looping_active and self.decoder_recur_alpha else -1,
+            )
 
         x = self.final_norm(x)
         if self.tie_embeddings:
@@ -1315,6 +1354,8 @@ def main() -> None:
         scalar_params.append(base_model.skip_weights)
     if base_model.skip_gates is not None:
         scalar_params.append(base_model.skip_gates)
+    if base_model.recur_alpha is not None:
+        scalar_params.append(base_model.recur_alpha)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.AdamW(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1373,6 +1414,8 @@ def main() -> None:
             f"every:{args.qat_lite_every} lambda:{args.qat_lite_lambda} ramp:linear "
             f"targets:{args.qat_lite_targets} penalty:{args.qat_lite_penalty} depth_power:{args.qat_lite_depth_power}"
         )
+    if base_model.recur_alpha is not None:
+        log0(f"recur_alpha:enabled params:{base_model.recur_alpha.numel()} init:{args.recur_alpha_init}")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
