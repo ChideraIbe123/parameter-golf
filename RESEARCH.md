@@ -187,6 +187,20 @@ Representative tuned result:
 - TTT `val_bpb`: `1.10776585`
 - total size: `16014204`
 
+Cleaned-up ramped QAT-lite result:
+
+- raw pre-quant `val_bpb`: `1.1124`
+- quantized `val_bpb`: `1.1317`
+- TTT `val_bpb`: `1.10702468`
+- total size: `16009986`
+
+Interpretation of the cleaned-up ramped run:
+
+- best final TTT seen so far in this research round
+- slightly better quantized result than the plain EMA-off baseline
+- still over the cap by `9986` bytes
+- the overage is effectively all code-size pressure, not model-size pressure
+
 Conclusion:
 
 - QAT-lite is the most promising novel pretraining-side direction tested so far
@@ -275,6 +289,7 @@ What seems true right now:
 5. QAT-lite is the best novel pretraining-side direction tested so far, but not yet strong enough.
 6. QACT-lite alone is not better than baseline.
 7. The code budget matters enough that dead experiment paths should be removed from `train_gpt.py` once they stop paying off.
+8. The cleaned-up ramped QAT-lite branch is currently the best-performing branch found in this round, but it still needs about `10 KB` of artifact reduction to become submission-legal.
 
 ## Recommended Next Steps
 
@@ -284,6 +299,7 @@ If continuing pretraining-side novelty:
 2. use QAT-lite as the main surviving novelty path
 3. prefer ramped/late QAT-lite over carrying extra dead regularizers in the main file
 4. only revive QACT-lite if a combined run clearly beats QAT-lite alone
+5. prioritize code-size reduction on the current best QAT-lite branch before adding more modeling novelty
 
 If optimizing for highest practical win probability instead:
 
