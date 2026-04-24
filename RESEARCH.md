@@ -335,6 +335,27 @@ If continuing pretraining-side novelty:
 6. use the current QAT-lite branch to test selective targets (`q`, `k`, `qk`, `qk+proj`) and smarter penalties (`mse`, `clip`, `hybrid`) before inventing a new family of tricks
 7. treat MuonEq-R as part of the mainline stack, not an optional tweak
 
+## Next High-Upside Hypothesis
+
+### Late-start EMA on top of MuonEq-R
+
+Rationale:
+
+- the public SP8192 records use EMA as part of the mainline recipe
+- EMA was harmful on earlier pre-MuonEq-R branches
+- after restoring MuonEq-R, the branch quality jumped substantially
+- this makes it plausible that the earlier EMA failure was due to optimizer/stack mismatch, not because EMA is inherently wrong for this model
+
+Implementation added:
+
+- `EMA_START_FRAC`
+
+Idea:
+
+- keep `EMA_DECAY=0.9965`
+- start EMA only after the unstable early phase, e.g. after recurrence activation (`~0.35`) or later
+- test it on top of the current MuonEq-R branch rather than on the older weaker branch
+
 If optimizing for highest practical win probability instead:
 
 1. recover the exact public SP8192 record recipe cleanly

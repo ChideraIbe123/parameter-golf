@@ -131,6 +131,7 @@ class Hyperparameters:
 
     # EMA.
     ema_decay = float(os.environ.get("EMA_DECAY", "0.0"))
+    ema_start_frac = float(os.environ.get("EMA_START_FRAC", 0.0))
 
     # Experimental features stay opt-in so default behavior tracks the strongest merged recipe.
     attn_gate_enabled = bool(int(os.environ.get("ATTN_GATE_ENABLED", "0")))
@@ -1360,6 +1361,9 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
+    ema_start_step = int(args.iterations * args.ema_start_frac)
+    if args.ema_decay > 0:
+        log0(f"ema:enabled decay:{args.ema_decay} start_step:{ema_start_step}")
     qat_lite_named_params = select_qat_lite_params(base_model, args) if args.qat_lite_enabled else []
     qat_lite_start_step = int(args.iterations * args.qat_lite_start_frac)
     if args.qat_lite_enabled:
@@ -1533,8 +1537,8 @@ def main() -> None:
         zero_grad_all()
 
         # EMA weight averaging (PR #1493).
-        if args.ema_decay > 0:
-            if step == 0:
+        if args.ema_decay > 0 and step >= ema_start_step:
+            if step == ema_start_step:
                 ema_state = {k: v.clone() for k, v in base_model.state_dict().items()}
             else:
                 d = args.ema_decay
