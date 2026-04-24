@@ -130,6 +130,10 @@ class Hyperparameters:
     embed_clip_sigmas = float(os.environ.get("EMBED_CLIP_SIGMAS", 20.0))
     qk_clip_sigmas = float(os.environ.get("QK_CLIP_SIGMAS", 12.85))
     compressor = os.environ.get("COMPRESSOR", "brotli")
+    qres_enabled = bool(int(os.environ.get("QRES_ENABLED", "0")))
+    qres_rank = int(os.environ.get("QRES_RANK", 1))
+    qres_layer_start = int(os.environ.get("QRES_LAYER_START", 7))
+    qres_targets = os.environ.get("QRES_TARGETS", "qk")
 
     # EMA.
     ema_decay = float(os.environ.get("EMA_DECAY", "0.0"))
@@ -567,6 +571,19 @@ def classify_quant_param(name):
         return "qk"
     return "matrix"
 
+def should_apply_qres(name, args):
+    if not args.qres_enabled or args.qres_rank <= 0:
+        return False
+    match = re.search(r"blocks\.(\d+)\.attn\.(c_q|c_k|proj)\.weight$", name)
+    if match is None:
+        return False
+    layer_idx = int(match.group(1))
+    if layer_idx < args.qres_layer_start:
+        return False
+    proj_name = match.group(2)
+    targets = args.qres_targets
+    return ("q" in targets and proj_name == "c_q") or ("k" in targets and proj_name == "c_k") or ("proj" in targets and proj_name == "proj")
+
 def fake_quantize_rowwise(weight: Tensor, bits: int, clip_sigmas: float) -> Tensor:
     if bits <= 0:
         raise ValueError(f"bits must be positive, got {bits}")
@@ -697,6 +714,31 @@ def gptq_quantize_weight(w, H, clip_sigmas=3.0, clip_range=63, block_size=128):
             W_work[:, i2:] -= Err @ Hinv[i1:i2, i2:]
     return Q[:, invperm], s
 
+def low_rank_residual(residual, rank):
+    rank = min(rank, min(residual.shape))
+    if rank <= 0:
+        return None, None
+    U, S, Vh = torch.linalg.svd(residual.float(), full_matrices=False)
+    root_s = S[:rank].sqrt()
+    u = (U[:, :rank] * root_s).to(torch.float16)
+    v = (root_s[:, None] * Vh[:rank, :]).to(torch.float16)
+    return u, v
+
+def reconstruct_quantized_tensor(name, result, meta):
+    info = meta.get(name)
+    if info is None:
+        return None
+    if "passthrough" in info:
+        return result[name].float()
+    q, s = result[name + ".q"], result[name + ".scale"]
+    if s.ndim > 0:
+        t = q.float() * s.float().view(q.shape[0], *[1] * (q.ndim - 1))
+    else:
+        t = q.float() * float(s.item())
+    if name + ".u" in result and name + ".v" in result:
+        t = t + result[name + ".u"].float() @ result[name + ".v"].float()
+    return t
+
 def gptq_mixed_quantize(state_dict, hessians, args):
     result = {}
     meta = {}
@@ -723,6 +765,14 @@ def gptq_mixed_quantize(state_dict, hessians, args):
         q, s = gptq_quantize_weight(t, hessians[name], clip_sigmas=cs, clip_range=2 ** (bits - 1) - 1)
         result[name + ".q"] = q
         result[name + ".scale"] = s
+        if should_apply_qres(name, args):
+            deq = reconstruct_quantized_tensor(name, result, {name: f"gptq (int{bits})"})
+            u, v = low_rank_residual(t.float() - deq, args.qres_rank)
+            if u is not None and v is not None:
+                result[name + ".u"] = u
+                result[name + ".v"] = v
+                meta[name] = f"gptq+qres (int{bits}+r{u.shape[1]})"
+                continue
         meta[name] = f"gptq (int{bits})"
     categories = collections.defaultdict(set)
     for name, cat in meta.items():
@@ -737,17 +787,9 @@ def dequantize_mixed(result, meta, template_sd):
         if info is None:
             continue
         orig_dtype = orig.dtype
-        if "passthrough" in info:
-            t = result[name]
-            if t.dtype == torch.float16 and orig_dtype in (torch.float32, torch.bfloat16):
-                t = t.to(orig_dtype)
-            out[name] = t
-            continue
-        q, s = result[name + ".q"], result[name + ".scale"]
-        if s.ndim > 0:
-            out[name] = (q.float() * s.float().view(q.shape[0], *[1] * (q.ndim - 1))).to(orig_dtype)
-        else:
-            out[name] = (q.float() * float(s.item())).to(orig_dtype)
+        t = reconstruct_quantized_tensor(name, result, meta)
+        if t is not None:
+            out[name] = t.to(orig_dtype)
     return out
 
 _BSHF_MAGIC = b"BSHF"
@@ -1418,6 +1460,8 @@ def main() -> None:
             f"every:{args.qat_lite_every} lambda:{args.qat_lite_lambda} ramp:linear "
             f"targets:{args.qat_lite_targets} penalty:{args.qat_lite_penalty} depth_power:{args.qat_lite_depth_power}"
         )
+    if args.qres_enabled and args.qres_rank > 0:
+        log0(f"qres:enabled rank:{args.qres_rank} layer_start:{args.qres_layer_start} targets:{args.qres_targets}")
     if base_model.recur_alpha is not None:
         log0(f"recur_alpha:enabled params:{base_model.recur_alpha.numel()} init:{args.recur_alpha_init}")
     log0(
@@ -1680,11 +1724,7 @@ def main() -> None:
         info = quant_meta.get(name)
         if info is None or "passthrough" in info:
             continue
-        q, s = quant_result[name + ".q"], quant_result[name + ".scale"]
-        if s.ndim > 0:
-            deq = (q.float() * s.float().view(q.shape[0], *[1] * (q.ndim - 1)))
-        else:
-            deq = q.float() * float(s.item())
+        deq = reconstruct_quantized_tensor(name, quant_result, quant_meta)
         mse = (orig_tensor.float() - deq).pow(2).mean().item()
         quant_error_per_layer[name] = mse
     if quant_error_per_layer:
