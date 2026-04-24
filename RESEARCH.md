@@ -149,7 +149,9 @@ Core knobs:
 - `QAT_LITE_BITS`
 - `QAT_LITE_CLIP_SIGMAS`
 - `QAT_LITE_LAYER_START`
-- `QAT_LITE_INCLUDE_PROJ`
+- `QAT_LITE_TARGETS`
+- `QAT_LITE_PENALTY`
+- `QAT_LITE_DEPTH_POWER`
 
 Original stronger config:
 
@@ -300,6 +302,7 @@ If continuing pretraining-side novelty:
 3. prefer ramped/late QAT-lite over carrying extra dead regularizers in the main file
 4. only revive QACT-lite if a combined run clearly beats QAT-lite alone
 5. prioritize code-size reduction on the current best QAT-lite branch before adding more modeling novelty
+6. use the current QAT-lite branch to test selective targets (`q`, `k`, `qk`, `qk+proj`) and smarter penalties (`mse`, `clip`, `hybrid`) before inventing a new family of tricks
 
 If optimizing for highest practical win probability instead:
 

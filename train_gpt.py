@@ -163,7 +163,9 @@ class Hyperparameters:
     qat_lite_bits = int(os.environ.get("QAT_LITE_BITS", 6))
     qat_lite_clip_sigmas = float(os.environ.get("QAT_LITE_CLIP_SIGMAS", 12.85))
     qat_lite_layer_start = int(os.environ.get("QAT_LITE_LAYER_START", 7))
-    qat_lite_include_proj = bool(int(os.environ.get("QAT_LITE_INCLUDE_PROJ", "0")))
+    qat_lite_targets = os.environ.get("QAT_LITE_TARGETS", "qk")
+    qat_lite_penalty = os.environ.get("QAT_LITE_PENALTY", "mse")
+    qat_lite_depth_power = float(os.environ.get("QAT_LITE_DEPTH_POWER", 0.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -566,9 +568,15 @@ def fake_quantize_rowwise(weight: Tensor, bits: int, clip_sigmas: float) -> Tens
     q = torch.clamp(torch.round(w / scale), -clip_range, clip_range)
     return (q * scale).to(weight.dtype)
 
-def select_qat_lite_params(model: nn.Module, args) -> list[tuple[str, nn.Parameter]]:
+def select_qat_lite_params(model: nn.Module, args) -> list[tuple[str, nn.Parameter, int]]:
     pattern = re.compile(r"blocks\.(\d+)\.attn\.(c_q|c_k|proj)\.weight$")
     selected = []
+    targets = set()
+    if "proj" in args.qat_lite_targets:
+        targets.add("proj")
+    for target_key in ("q", "k"):
+        if target_key in args.qat_lite_targets:
+            targets.add(target_key)
     for name, param in model.named_parameters():
         match = pattern.search(name)
         if match is None:
@@ -577,20 +585,32 @@ def select_qat_lite_params(model: nn.Module, args) -> list[tuple[str, nn.Paramet
         proj_name = match.group(2)
         if layer_idx < args.qat_lite_layer_start:
             continue
-        if proj_name == "proj" and not args.qat_lite_include_proj:
-            continue
-        if proj_name in ("c_q", "c_k") or args.qat_lite_include_proj:
-            selected.append((name, param))
+        target_key = "q" if proj_name == "c_q" else "k" if proj_name == "c_k" else "proj"
+        if target_key in targets:
+            selected.append((name, param, layer_idx))
     return selected
 
-def compute_qat_lite_penalty(named_params: list[tuple[str, nn.Parameter]], args) -> Tensor:
+def compute_qat_lite_penalty(named_params: list[tuple[str, nn.Parameter, int]], args) -> Tensor:
     if not named_params:
         raise ValueError("named_params must be non-empty")
     penalty = torch.zeros((), device=named_params[0][1].device, dtype=torch.float32)
-    for _, param in named_params:
-        quantized = fake_quantize_rowwise(param, args.qat_lite_bits, args.qat_lite_clip_sigmas).detach()
-        penalty = penalty + F.mse_loss(param.float(), quantized.float(), reduction="mean")
-    return penalty / len(named_params)
+    total_weight = 0.0
+    clip_range = 2 ** (args.qat_lite_bits - 1) - 1
+    for _, param, layer_idx in named_params:
+        weight = ((layer_idx + 1) / args.num_layers) ** args.qat_lite_depth_power if args.qat_lite_depth_power > 0 else 1.0
+        w = param.float()
+        row_std = w.std(dim=1, keepdim=True)
+        scale = (args.qat_lite_clip_sigmas * row_std / clip_range).clamp_min(1e-10)
+        clip_bound = clip_range * scale.detach()
+        clip_penalty = F.relu(w.abs() - clip_bound).square().mean()
+        if args.qat_lite_penalty == "clip":
+            penalty = penalty + weight * clip_penalty
+        else:
+            quantized = fake_quantize_rowwise(param, args.qat_lite_bits, args.qat_lite_clip_sigmas).detach()
+            mse_penalty = F.mse_loss(w, quantized.float(), reduction="mean")
+            penalty = penalty + weight * (0.5 * (mse_penalty + clip_penalty) if args.qat_lite_penalty == "hybrid" else mse_penalty)
+        total_weight += weight
+    return penalty / max(total_weight, 1e-9)
 
 def collect_hessians(model, train_loader, args, device, n_calibration_batches=64):
     hessians = {}
@@ -1338,7 +1358,8 @@ def main() -> None:
         log0(
             f"qat_lite:enabled params:{len(qat_lite_named_params)} start_step:{qat_lite_start_step} "
             f"bits:{args.qat_lite_bits} clip_sigmas:{args.qat_lite_clip_sigmas} "
-            f"every:{args.qat_lite_every} lambda:{args.qat_lite_lambda} ramp:linear"
+            f"every:{args.qat_lite_every} lambda:{args.qat_lite_lambda} ramp:linear "
+            f"targets:{args.qat_lite_targets} penalty:{args.qat_lite_penalty} depth_power:{args.qat_lite_depth_power}"
         )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
