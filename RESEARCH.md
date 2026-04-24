@@ -232,6 +232,7 @@ Conclusion:
 
 - QACT-lite alone does not look better than baseline
 - likely worse than the stronger QAT-lite attempt
+- not worth carrying in the main working branch unless combined in a future experiment that clearly wins
 
 Relevant commit:
 
@@ -273,14 +274,16 @@ What seems true right now:
 4. Q/K-specific higher-precision GPTQ was too expensive in bytes.
 5. QAT-lite is the best novel pretraining-side direction tested so far, but not yet strong enough.
 6. QACT-lite alone is not better than baseline.
+7. The code budget matters enough that dead experiment paths should be removed from `train_gpt.py` once they stop paying off.
 
 ## Recommended Next Steps
 
 If continuing pretraining-side novelty:
 
-1. return to the stronger original QAT-lite recipe
-2. compare QAT-lite plus a very small QACT-lite term
-3. keep baseline quantization settings fixed while tuning training-side novelty
+1. keep baseline quantization settings fixed while tuning training-side novelty
+2. use QAT-lite as the main surviving novelty path
+3. prefer ramped/late QAT-lite over carrying extra dead regularizers in the main file
+4. only revive QACT-lite if a combined run clearly beats QAT-lite alone
 
 If optimizing for highest practical win probability instead:
 
