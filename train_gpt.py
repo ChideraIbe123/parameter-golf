@@ -145,6 +145,8 @@ class Hyperparameters:
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.02))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.99))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
+    muon_eqr = bool(int(os.environ.get("MUON_EQR", "1")))
+    muon_eqr_eps = float(os.environ.get("MUON_EQR_EPS", 1e-7))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.92))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 1500))
     muon_wd = float(os.environ.get("MUON_WD", 0.095))
@@ -191,10 +193,10 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
 
 
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True, weight_decay: float = 0.0):
+    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True, weight_decay: float = 0.0, row_normalize: bool = True, row_norm_eps: float = 1e-7):
         super().__init__(
             params,
-            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov, weight_decay=weight_decay),
+            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov, weight_decay=weight_decay, row_normalize=row_normalize, row_norm_eps=row_norm_eps),
         )
 
     @torch.no_grad()
@@ -216,6 +218,8 @@ class Muon(torch.optim.Optimizer):
             momentum = group["momentum"]
             backend_steps = group["backend_steps"]
             nesterov = group["nesterov"]
+            row_normalize = group["row_normalize"]
+            row_norm_eps = group["row_norm_eps"]
 
             total_params = sum(int(p.numel()) for p in params)
             updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
@@ -231,6 +235,8 @@ class Muon(torch.optim.Optimizer):
                     buf.mul_(momentum).add_(g)
                     if nesterov:
                         g = g.add(buf, alpha=momentum)
+                    if row_normalize:
+                        g = g / g.norm(dim=1, keepdim=True).clamp_min(row_norm_eps)
                     g = zeropower_via_newtonschulz5(g, steps=backend_steps)
                     # Scale correction from Muon reference implementations.
                     g *= max(1, g.size(0) / g.size(1)) ** 0.5
@@ -1321,6 +1327,8 @@ def main() -> None:
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
+        row_normalize=args.muon_eqr,
+        row_norm_eps=args.muon_eqr_eps,
         weight_decay=args.muon_wd,
     )
     for group in optimizer_muon.param_groups:

@@ -56,6 +56,20 @@ Conclusion:
 
 - keep `EMA_DECAY=0` unless a future branch proves otherwise
 
+### MuonEq-R gap
+
+Important discovery from comparing the current branch to the public SP8192 record:
+
+- the public record explicitly uses **MuonEq-R**
+- MuonEq-R is described in the record docs as **row-normalized Muon before Newton-Schulz**
+- the current branch had drifted back to plain Muon, i.e. it was missing that row-normalization step
+
+Why this matters:
+
+- the public record treats MuonEq-R as a core stack component, not a minor extra
+- earlier record notes attribute about `~0.001 BPB` improvement to MuonEq-R by itself
+- because our pre-TTT gap to the public record is huge, recovering missing record ingredients is higher-value than piling on more speculative regularizers
+
 ## Novel Technique Experiments
 
 ### 1. OSP-lite
