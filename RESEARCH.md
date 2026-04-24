@@ -106,6 +106,44 @@ Fix applied:
 
 - when `MAX_WALLCLOCK_SECONDS` is active, fraction-gated features now use wallclock progress as well as nominal iteration progress
 
+### Wallclock-aware late-stage run
+
+First run after fixing wallclock-aware scheduling:
+
+- `MUON_EQR=1`
+- `EMA_DECAY=0.9965`
+- `EMA_START_FRAC=0.35`
+- ramped QAT-lite enabled
+
+What actually happened:
+
+- depth recurrence finally activated for real:
+  - `layer_loop:enabled step:1703 frac:0.350`
+- step time jumped from about `123 ms` to about `155 ms`
+- training stopped much earlier, at only about `3880` steps, because recurrence now consumed real wallclock budget
+
+Pre-EMA raw validation right before stopping:
+
+- raw pre-EMA `val_bpb`: `1.1042`
+
+That is notable because:
+
+- it is much better than the earlier MuonEq-R + QAT-lite run without real loop activation (`1.1085`)
+- it strongly suggests that the recurrence schedule was one of the major missing pieces
+
+However, EMA still failed badly on top of that stronger branch:
+
+- post-EMA pre-quant `val_bpb`: `1.2211`
+- quantized `val_bpb`: `1.2320`
+- TTT `val_bpb`: `1.11873231`
+
+Interpretation:
+
+- the scheduling fix was real and important
+- the recurrence activation looks promising
+- EMA remains actively harmful, even after restoring MuonEq-R
+- the next experiment should isolate **wallclock-aware recurrence without EMA**
+
 ## Novel Technique Experiments
 
 ### 1. OSP-lite
@@ -342,8 +380,10 @@ What seems true right now:
 6. QACT-lite alone is not better than baseline.
 7. The code budget matters enough that dead experiment paths should be removed from `train_gpt.py` once they stop paying off.
 8. The cleaned-up ramped QAT-lite branch was a strong stepping stone, but restoring MuonEq-R produced a much larger gain.
-9. The current best branch in this round is: MuonEq-R + ramped QAT-lite, with `ttt val_bpb = 1.10276340`.
-10. The branch is still over the cap, but at this point the dominant challenge is closing the remaining quality gap to the public record while eventually recovering submission legality.
+9. MuonEq-R is a real breakthrough, but after the scheduling fix there is strong evidence that the depth-recurrence activation was also previously missing from effective runs.
+10. Late-start EMA still appears harmful even on the stronger MuonEq-R branch.
+11. The current best completed branch in this round is still: MuonEq-R + ramped QAT-lite, with `ttt val_bpb = 1.10276340`.
+12. The branch is still over the cap, but at this point the dominant challenge is closing the remaining quality gap to the public record while eventually recovering submission legality.
 
 ## Recommended Next Steps
 
@@ -359,24 +399,29 @@ If continuing pretraining-side novelty:
 
 ## Next High-Upside Hypothesis
 
-### Late-start EMA on top of MuonEq-R
+### Wallclock-aware recurrence without EMA
 
 Rationale:
 
-- the public SP8192 records use EMA as part of the mainline recipe
-- EMA was harmful on earlier pre-MuonEq-R branches
-- after restoring MuonEq-R, the branch quality jumped substantially
-- this makes it plausible that the earlier EMA failure was due to optimizer/stack mismatch, not because EMA is inherently wrong for this model
+- after the scheduling fix, recurrence actually turns on around wallclock fraction `0.35`
+- the first real late-stage run reached raw pre-EMA `1.1042`, which is one of the best raw numbers seen in this round
+- the strongest visible positive change in that run was recurrence activation
+- the strongest visible negative change was EMA application
 
 Implementation added:
 
+- wallclock-aware fraction scheduling for late-stage features
 - `EMA_START_FRAC`
 
 Idea:
 
-- keep `EMA_DECAY=0.9965`
-- start EMA only after the unstable early phase, e.g. after recurrence activation (`~0.35`) or later
-- test it on top of the current MuonEq-R branch rather than on the older weaker branch
+- keep `MUON_EQR=1`
+- keep wallclock-aware recurrence activation
+- set `EMA_DECAY=0`
+- test both:
+  - recurrence + no QAT
+  - recurrence + ramped QAT-lite
+- compare them directly against the earlier MuonEq-R branches that did not have real recurrence activation
 
 If optimizing for highest practical win probability instead:
 
