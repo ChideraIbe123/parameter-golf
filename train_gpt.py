@@ -1180,6 +1180,10 @@ class GPT(nn.Module):
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
+        if self.recur_alpha is not None and not self.looping_active:
+            # Keep loop-only scalars in the autograd graph before recurrence activates so
+            # DDP does not treat them as permanently unused parameters.
+            x = x + self.recur_alpha.to(dtype=x.dtype).sum() * 0.0
         x0 = x
         skips: list[Tensor] = []
 
