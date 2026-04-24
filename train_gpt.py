@@ -155,6 +155,16 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.3))
 
+    # LR-QAT-inspired late-stage fake-quant regularization on sensitive attention weights.
+    qat_lite_enabled = bool(int(os.environ.get("QAT_LITE_ENABLED", "0")))
+    qat_lite_start_frac = float(os.environ.get("QAT_LITE_START_FRAC", 0.55))
+    qat_lite_every = int(os.environ.get("QAT_LITE_EVERY", 4))
+    qat_lite_lambda = float(os.environ.get("QAT_LITE_LAMBDA", 0.02))
+    qat_lite_bits = int(os.environ.get("QAT_LITE_BITS", 6))
+    qat_lite_clip_sigmas = float(os.environ.get("QAT_LITE_CLIP_SIGMAS", 12.85))
+    qat_lite_layer_start = int(os.environ.get("QAT_LITE_LAYER_START", 7))
+    qat_lite_include_proj = bool(int(os.environ.get("QAT_LITE_INCLUDE_PROJ", "0")))
+
 # -----------------------------
 # MUON OPTIMIZER 
 # -----------------------------
@@ -545,6 +555,42 @@ def classify_quant_param(name):
     if ".attn.c_q.weight" in name or ".attn.c_k.weight" in name:
         return "qk"
     return "matrix"
+
+def fake_quantize_rowwise(weight: Tensor, bits: int, clip_sigmas: float) -> Tensor:
+    if bits <= 0:
+        raise ValueError(f"bits must be positive, got {bits}")
+    clip_range = 2 ** (bits - 1) - 1
+    w = weight.float()
+    row_std = w.std(dim=1, keepdim=True)
+    scale = (clip_sigmas * row_std / clip_range).clamp_min(1e-10)
+    q = torch.clamp(torch.round(w / scale), -clip_range, clip_range)
+    return (q * scale).to(weight.dtype)
+
+def select_qat_lite_params(model: nn.Module, args) -> list[tuple[str, nn.Parameter]]:
+    pattern = re.compile(r"blocks\.(\d+)\.attn\.(c_q|c_k|proj)\.weight$")
+    selected = []
+    for name, param in model.named_parameters():
+        match = pattern.search(name)
+        if match is None:
+            continue
+        layer_idx = int(match.group(1))
+        proj_name = match.group(2)
+        if layer_idx < args.qat_lite_layer_start:
+            continue
+        if proj_name == "proj" and not args.qat_lite_include_proj:
+            continue
+        if proj_name in ("c_q", "c_k") or args.qat_lite_include_proj:
+            selected.append((name, param))
+    return selected
+
+def compute_qat_lite_penalty(named_params: list[tuple[str, nn.Parameter]], args) -> Tensor:
+    if not named_params:
+        raise ValueError("named_params must be non-empty")
+    penalty = torch.zeros((), device=named_params[0][1].device, dtype=torch.float32)
+    for _, param in named_params:
+        quantized = fake_quantize_rowwise(param, args.qat_lite_bits, args.qat_lite_clip_sigmas).detach()
+        penalty = penalty + F.mse_loss(param.float(), quantized.float(), reduction="mean")
+    return penalty / len(named_params)
 
 def collect_hessians(model, train_loader, args, device, n_calibration_batches=64):
     hessians = {}
@@ -1286,6 +1332,14 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
+    qat_lite_named_params = select_qat_lite_params(base_model, args) if args.qat_lite_enabled else []
+    qat_lite_start_step = int(args.iterations * args.qat_lite_start_frac)
+    if args.qat_lite_enabled:
+        log0(
+            f"qat_lite:enabled params:{len(qat_lite_named_params)} start_step:{qat_lite_start_step} "
+            f"bits:{args.qat_lite_bits} clip_sigmas:{args.qat_lite_clip_sigmas} "
+            f"every:{args.qat_lite_every} lambda:{args.qat_lite_lambda}"
+        )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
@@ -1411,6 +1465,14 @@ def main() -> None:
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
+        qat_penalty_value = 0.0
+        apply_qat_lite = (
+            args.qat_lite_enabled
+            and len(qat_lite_named_params) > 0
+            and step >= qat_lite_start_step
+            and args.qat_lite_every > 0
+            and step % args.qat_lite_every == 0
+        )
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
@@ -1418,6 +1480,10 @@ def main() -> None:
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
             train_loss += loss.detach()
+            if apply_qat_lite and micro_step == grad_accum_steps - 1:
+                qat_penalty = compute_qat_lite_penalty(qat_lite_named_params, args)
+                qat_penalty_value = float(qat_penalty.item())
+                loss = loss + (grad_accum_steps * args.qat_lite_lambda) * qat_penalty
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
 
@@ -1462,6 +1528,7 @@ def main() -> None:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                f"{f' qat_penalty:{qat_penalty_value:.6f}' if apply_qat_lite else ''}"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
