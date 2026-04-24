@@ -78,12 +78,10 @@ class Hyperparameters:
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 5.25))
 
     # Model shape.
-    osp_lite_enabled = bool(int(os.environ.get("OSP_LITE_ENABLED", "1")))
     vocab_size = int(os.environ.get("VOCAB_SIZE", DEFAULT_VOCAB_SIZE))
     num_layers = int(os.environ.get("NUM_LAYERS", 11))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
-    embedding_dim = int(os.environ.get("EMBEDDING_DIM", str(max((7 * model_dim) // 8, 448) if osp_lite_enabled else model_dim)))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 4))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
@@ -125,12 +123,14 @@ class Hyperparameters:
     gptq_calibration_batches = int(os.environ.get("GPTQ_CALIBRATION_BATCHES", 64))
     matrix_bits = int(os.environ.get("MATRIX_BITS", 6))
     embed_bits = int(os.environ.get("EMBED_BITS", 8))
+    qk_bits = int(os.environ.get("QK_BITS", 8))
     matrix_clip_sigmas = float(os.environ.get("MATRIX_CLIP_SIGMAS", 12.85))
     embed_clip_sigmas = float(os.environ.get("EMBED_CLIP_SIGMAS", 20.0))
+    qk_clip_sigmas = float(os.environ.get("QK_CLIP_SIGMAS", 20.0))
     compressor = os.environ.get("COMPRESSOR", "brotli")
 
     # EMA.
-    ema_decay = float(os.environ.get("EMA_DECAY", "0.0" if osp_lite_enabled else "0.9965"))
+    ema_decay = float(os.environ.get("EMA_DECAY", "0.0"))
 
     # Experimental features stay opt-in so default behavior tracks the strongest merged recipe.
     attn_gate_enabled = bool(int(os.environ.get("ATTN_GATE_ENABLED", "0")))
@@ -531,13 +531,20 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
 )
 
 def classify_param(name):
-    if "tok_emb" in name or "lm_head" in name or "embed_proj" in name or "head_proj" in name:
+    if "tok_emb" in name or "lm_head" in name:
         return "embed"
     if ".mlp." in name:
         return "mlp"
     if ".attn." in name:
         return "attn"
     return "other"
+
+def classify_quant_param(name):
+    if "tok_emb" in name or "lm_head" in name:
+        return "embed"
+    if ".attn.c_q.weight" in name or ".attn.c_k.weight" in name:
+        return "qk"
+    return "matrix"
 
 def collect_hessians(model, train_loader, args, device, n_calibration_batches=64):
     hessians = {}
@@ -566,8 +573,7 @@ def collect_hessians(model, train_loader, args, device, n_calibration_batches=64
                     hessians[name] = torch.zeros(x.shape[1], x.shape[1], dtype=torch.float32, device=device)
                 hessians[name].addmm_(x.T, x)
             return hook_fn
-        hook_module = model.head_proj if model.head_proj is not None else model.final_norm
-        hooks.append(hook_module.register_forward_hook(make_output_hook("tok_emb.weight")))
+        hooks.append(model.final_norm.register_forward_hook(make_output_hook("tok_emb.weight")))
     model.eval()
     with torch.no_grad():
         for _ in range(n_calibration_batches):
@@ -629,8 +635,16 @@ def gptq_mixed_quantize(state_dict, hessians, args):
             result[name] = t.to(torch.float16)
             meta[name] = "passthrough (missing hessian)"
             continue
-        cs = args.embed_clip_sigmas if "tok_emb" in name else args.matrix_clip_sigmas
-        bits = args.embed_bits if "tok_emb" in name else args.matrix_bits
+        quant_cat = classify_quant_param(name)
+        if quant_cat == "embed":
+            cs = args.embed_clip_sigmas
+            bits = args.embed_bits
+        elif quant_cat == "qk":
+            cs = args.qk_clip_sigmas
+            bits = args.qk_bits
+        else:
+            cs = args.matrix_clip_sigmas
+            bits = args.matrix_bits
         q, s = gptq_quantize_weight(t, hessians[name], clip_sigmas=cs, clip_range=2 ** (bits - 1) - 1)
         result[name + ".q"] = q
         result[name + ".scale"] = s
@@ -1012,9 +1026,7 @@ class GPT(nn.Module):
         self.tie_embeddings = h.tie_embeddings
         self.tied_embed_init_std = h.tied_embed_init_std
         self.logit_softcap = h.logit_softcap
-        self.tok_emb = nn.Embedding(h.vocab_size, h.embedding_dim)
-        self.embed_proj = CastedLinear(h.embedding_dim, h.model_dim, bias=False) if h.embedding_dim != h.model_dim else None
-        self.head_proj = CastedLinear(h.model_dim, h.embedding_dim, bias=False) if h.embedding_dim != h.model_dim else None
+        self.tok_emb = nn.Embedding(h.vocab_size, h.model_dim)
         self.num_encoder_layers = h.num_layers // 2
         self.num_decoder_layers = h.num_layers - self.num_encoder_layers
         self.blocks = nn.ModuleList([
@@ -1028,7 +1040,7 @@ class GPT(nn.Module):
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, h.model_dim, dtype=torch.float32))
         self.skip_gates = nn.Parameter(torch.zeros(self.num_skip_weights, h.model_dim, dtype=torch.float32)) if h.skip_gates_enabled else None
         self.final_norm = RMSNorm()
-        self.lm_head = None if h.tie_embeddings else CastedLinear(h.embedding_dim, h.vocab_size, bias=False)
+        self.lm_head = None if h.tie_embeddings else CastedLinear(h.model_dim, h.vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
 
@@ -1072,8 +1084,6 @@ class GPT(nn.Module):
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
-        if self.embed_proj is not None:
-            x = self.embed_proj(x)
         x0 = x
         skips: list[Tensor] = []
 
@@ -1094,8 +1104,6 @@ class GPT(nn.Module):
             x = self.blocks[i](x, x0)
 
         x = self.final_norm(x)
-        if self.head_proj is not None:
-            x = self.head_proj(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
         else:
@@ -1220,25 +1228,14 @@ def main() -> None:
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
-    aux_named_params = []
-    if base_model.embed_proj is not None:
-        aux_named_params.extend([
-            ("embed_proj.weight", base_model.embed_proj.weight),
-            *((f"embed_proj.{n}", p) for n, p in base_model.embed_proj.named_parameters(recurse=False) if n != "weight"),
-        ])
-    if base_model.head_proj is not None:
-        aux_named_params.extend([
-            ("head_proj.weight", base_model.head_proj.weight),
-            *((f"head_proj.{n}", p) for n, p in base_model.head_proj.named_parameters(recurse=False) if n != "weight"),
-        ])
     matrix_params = [
         p
-        for name, p in block_named_params + aux_named_params
+        for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     scalar_params = [
         p
-        for name, p in block_named_params + aux_named_params
+        for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     if base_model.skip_weights.numel() > 0:
