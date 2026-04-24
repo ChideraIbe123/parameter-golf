@@ -214,6 +214,60 @@ New implication:
 - the recurrence start fraction is a real optimization lever, not just a binary on/off switch
 - the branch now looks strong enough that a small local sweep around `0.40` is higher-value than most new architectural ideas
 
+### Recurrence schedule tuned later again: `ENABLE_LOOPING_AT=0.42`
+
+Follow-up run with recurrence delayed a bit further:
+
+- `MUON_EQR=1`
+- `EMA_DECAY=0`
+- `ENABLE_LOOPING_AT=0.42`
+- ramped QAT-lite enabled
+
+Result:
+
+- raw pre-quant `val_bpb`: `1.1034`
+- quantized `val_bpb`: `1.1288`
+- TTT `val_bpb`: `1.09845764`
+- total size: `16063475`
+
+Interpretation:
+
+- this beat the earlier `ENABLE_LOOPING_AT=0.40` control (`1.09874205`) by about `0.00028 BPB`
+- raw pre-quant improved slightly
+- quantized BPB was a bit worse than the `0.40` run, but final TTT was better
+- this became the best control branch before recurrent-alpha gating
+
+### Recurrent-alpha gates on top of `ENABLE_LOOPING_AT=0.42`
+
+First run with learned recurrent-alpha gates enabled:
+
+- `MUON_EQR=1`
+- `EMA_DECAY=0`
+- `ENABLE_LOOPING_AT=0.42`
+- `RECUR_ALPHA_ENABLED=1`
+- `RECUR_ALPHA_INIT=1.0`
+- ramped QAT-lite enabled
+
+Result:
+
+- raw pre-quant `val_bpb`: `1.1036`
+- quantized `val_bpb`: `1.1222`
+- TTT `val_bpb`: `1.09808318`
+- total size: `16062189`
+
+Interpretation:
+
+- this did **not** produce a big jump, but it did improve the best control branch
+- gain vs the `0.42` control: about `0.00037 BPB`
+- quantized BPB improved materially (`1.1288 -> 1.1222`)
+- raw pre-quant moved slightly in the wrong direction, but final TTT still improved
+- the technique looks alive, just not transformative on its first shot
+
+New implication:
+
+- recurrent-alpha gating is likely additive with the recurrence schedule, but only weakly so far
+- it is worth one or two narrow follow-up ablations, not a large blind tuning tree
+
 ## Novel Technique Experiments
 
 ### 1. OSP-lite
