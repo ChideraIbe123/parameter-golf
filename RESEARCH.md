@@ -70,6 +70,20 @@ Why this matters:
 - earlier record notes attribute about `~0.001 BPB` improvement to MuonEq-R by itself
 - because our pre-TTT gap to the public record is huge, recovering missing record ingredients is higher-value than piling on more speculative regularizers
 
+Result after restoring MuonEq-R on the current QAT-lite branch:
+
+- raw pre-quant `val_bpb`: `1.1085`
+- quantized `val_bpb`: `1.1288`
+- TTT `val_bpb`: `1.10276340`
+- total size: `16056474`
+
+Interpretation:
+
+- by far the biggest improvement seen in this research round
+- improved best final TTT by about `0.00426 BPB`
+- confirms MuonEq-R was a materially missing record ingredient
+- still over the size cap, but now the branch is much more competitive on quality
+
 ## Novel Technique Experiments
 
 ### 1. OSP-lite
@@ -212,7 +226,7 @@ Cleaned-up ramped QAT-lite result:
 
 Interpretation of the cleaned-up ramped run:
 
-- best final TTT seen so far in this research round
+- temporarily became the best final TTT seen so far in this research round
 - slightly better quantized result than the plain EMA-off baseline
 - still over the cap by `9986` bytes
 - the overage is effectively all code-size pressure, not model-size pressure
@@ -305,7 +319,9 @@ What seems true right now:
 5. QAT-lite is the best novel pretraining-side direction tested so far, but not yet strong enough.
 6. QACT-lite alone is not better than baseline.
 7. The code budget matters enough that dead experiment paths should be removed from `train_gpt.py` once they stop paying off.
-8. The cleaned-up ramped QAT-lite branch is currently the best-performing branch found in this round, but it still needs about `10 KB` of artifact reduction to become submission-legal.
+8. The cleaned-up ramped QAT-lite branch was a strong stepping stone, but restoring MuonEq-R produced a much larger gain.
+9. The current best branch in this round is: MuonEq-R + ramped QAT-lite, with `ttt val_bpb = 1.10276340`.
+10. The branch is still over the cap, but at this point the dominant challenge is closing the remaining quality gap to the public record while eventually recovering submission legality.
 
 ## Recommended Next Steps
 
@@ -317,6 +333,7 @@ If continuing pretraining-side novelty:
 4. only revive QACT-lite if a combined run clearly beats QAT-lite alone
 5. prioritize code-size reduction on the current best QAT-lite branch before adding more modeling novelty
 6. use the current QAT-lite branch to test selective targets (`q`, `k`, `qk`, `qk+proj`) and smarter penalties (`mse`, `clip`, `hybrid`) before inventing a new family of tricks
+7. treat MuonEq-R as part of the mainline stack, not an optional tweak
 
 If optimizing for highest practical win probability instead:
 
