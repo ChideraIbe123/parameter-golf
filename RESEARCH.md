@@ -179,6 +179,41 @@ New implication:
 - because loop activation slows steps so much, `enable_looping_at=0.35` may not be optimal under a strict 600s wallclock cap
 - a slightly later recurrence start could plausibly preserve most of the quality gain while allowing more total training steps
 
+### Recurrence schedule tuned later: `ENABLE_LOOPING_AT=0.40`
+
+Follow-up run with the same core recipe, but delaying recurrence slightly:
+
+- `MUON_EQR=1`
+- `EMA_DECAY=0`
+- `ENABLE_LOOPING_AT=0.40`
+- ramped QAT-lite enabled
+
+Observed behavior:
+
+- `layer_loop:enabled step:1934 frac:0.400`
+- pre-loop step time stayed around `124 ms`
+- post-loop step time climbed more gently than the `0.35` run
+- training reached about `3934` steps instead of about `3886`
+
+Result:
+
+- raw pre-quant `val_bpb`: `1.1042`
+- quantized `val_bpb`: `1.1223`
+- TTT `val_bpb`: `1.09874205`
+- total size: `16061958`
+
+Interpretation:
+
+- this is the new best final TTT result seen so far in this research round
+- it beats the earlier `ENABLE_LOOPING_AT=0.35` recurrence run (`1.09968653`) by about `0.00094 BPB`
+- it also improves quantized quality materially (`1.1320 -> 1.1223`)
+- delaying recurrence slightly appears to preserve the recurrence benefit while recovering some useful extra training budget
+
+New implication:
+
+- the recurrence start fraction is a real optimization lever, not just a binary on/off switch
+- the branch now looks strong enough that a small local sweep around `0.40` is higher-value than most new architectural ideas
+
 ## Novel Technique Experiments
 
 ### 1. OSP-lite
@@ -417,7 +452,7 @@ What seems true right now:
 8. The cleaned-up ramped QAT-lite branch was a strong stepping stone, but restoring MuonEq-R produced a much larger gain.
 9. MuonEq-R is a real breakthrough, but after the scheduling fix there is strong evidence that the depth-recurrence activation was also previously missing from effective runs.
 10. Late-start EMA still appears harmful even on the stronger MuonEq-R branch.
-11. The current best completed branch in this round is now: MuonEq-R + real wallclock-aware recurrence + no EMA + ramped QAT-lite, with `ttt val_bpb = 1.09968653`.
+11. The current best completed branch in this round is now: MuonEq-R + real wallclock-aware recurrence + no EMA + ramped QAT-lite, with `ENABLE_LOOPING_AT=0.40` and `ttt val_bpb = 1.09874205`.
 12. Recurrence scheduling is now a major optimization lever because it improves quality but sharply reduces the number of training steps that fit in 600s.
 13. The branch is still over the cap, but at this point the dominant challenge is closing the remaining quality gap to the public record while eventually recovering submission legality.
 
@@ -440,7 +475,7 @@ If continuing pretraining-side novelty:
 Rationale:
 
 - after the scheduling fix, recurrence actually turns on around wallclock fraction `0.35`
-- real recurrence activation produced the best final TTT seen so far: `1.09968653`
+- real recurrence activation produced the best final TTT seen so far, and delaying it slightly to `ENABLE_LOOPING_AT=0.40` improved that again to `1.09874205`
 - however, it also reduced total training from about `4860` steps to about `3886` steps
 - this tradeoff suggests the start fraction itself may now be suboptimal
 
@@ -457,11 +492,11 @@ Idea:
 - test both:
   - recurrence + no QAT
   - recurrence + ramped QAT-lite
-- then, if QAT-lite remains helpful, sweep the recurrence activation point:
+- then, if QAT-lite remains helpful, sweep the recurrence activation point around the new best:
   - `enable_looping_at=0.38`
-  - `enable_looping_at=0.40`
+  - `enable_looping_at=0.42`
   - `enable_looping_at=0.45`
-- compare them against the current best `enable_looping_at=0.35` branch
+- compare them against the current best `enable_looping_at=0.40` branch
 
 If optimizing for highest practical win probability instead:
 
