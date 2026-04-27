@@ -729,7 +729,11 @@ def collect_hessians(model, train_loader, args, device, n_calibration_batches=64
                     x = x.reshape(-1, x.shape[-1])
                 if name not in hessians:
                     hessians[name] = torch.zeros(x.shape[1], x.shape[1], dtype=torch.float32, device=device)
+                    act_sumsq[name] = torch.zeros(x.shape[1], dtype=torch.float32, device=device)
+                    act_count[name] = 0
                 hessians[name].addmm_(x.T, x)
+                act_sumsq[name] += x.square().sum(dim=0)
+                act_count[name] += x.shape[0]
             return hook_fn
         hooks.append(model.final_norm.register_forward_hook(make_output_hook("tok_emb.weight")))
     model.eval()
