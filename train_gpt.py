@@ -1092,17 +1092,17 @@ class RecurLowRank(nn.Module):
     # Tiny pass-specific low-rank adapter for repeated loop visits.
     def __init__(self, dim: int, rank: int, alpha: float):
         super().__init__()
-        self.scale = alpha / max(rank, 1)
+        self.register_buffer("scale", torch.tensor(alpha / max(rank, 1), dtype=torch.float32), persistent=True)
         self.down = CastedLinear(dim, rank, bias=False)
         self.up = CastedLinear(rank, dim, bias=False)
         self.up._zero_init = True
 
     def graph_anchor(self, dtype: torch.dtype) -> Tensor:
-        return self.down.weight.to(dtype).sum() + self.up.weight.to(dtype).sum()
+        return self.down.weight.to(dtype).sum() + self.up.weight.to(dtype).sum() + self.scale.to(dtype)
 
     def forward(self, x: Tensor) -> Tensor:
         h = F.rms_norm(x, (x.size(-1),))
-        return x + self.up(self.down(h)) * self.scale
+        return x + self.up(self.down(h)) * self.scale.to(dtype=x.dtype)
 
 
 class Block(nn.Module):
