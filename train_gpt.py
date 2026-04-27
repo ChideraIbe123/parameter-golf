@@ -143,6 +143,8 @@ class Hyperparameters:
     hqclip_enabled = bool(int(os.environ.get("HQCLIP_ENABLED", "0")))
     hqclip_spread = float(os.environ.get("HQCLIP_SPREAD", 0.15))
     hqclip_steps = int(os.environ.get("HQCLIP_STEPS", 3))
+    hqclip_targets = os.environ.get("HQCLIP_TARGETS", "all")
+    hqclip_layer_start = int(os.environ.get("HQCLIP_LAYER_START", -1))
 
     # EMA.
     ema_decay = float(os.environ.get("EMA_DECAY", "0.0"))
@@ -593,6 +595,24 @@ def should_apply_qres(name, args):
     targets = args.qres_targets
     return ("q" in targets and proj_name == "c_q") or ("k" in targets and proj_name == "c_k") or ("proj" in targets and proj_name == "proj")
 
+def should_apply_hqclip(name, quant_cat, args):
+    if not args.hqclip_enabled:
+        return False
+    if args.hqclip_layer_start >= 0:
+        match = re.search(r"blocks\.(\d+)\.", name)
+        if match is None or int(match.group(1)) < args.hqclip_layer_start:
+            return False
+    targets = args.hqclip_targets
+    if "all" in targets:
+        return True
+    if quant_cat == "qk":
+        return "qk" in targets
+    if quant_cat == "embed":
+        return "embed" in targets
+    if quant_cat == "matrix":
+        return "matrix" in targets
+    return False
+
 def fake_quantize_rowwise(weight: Tensor, bits: int, clip_sigmas: float) -> Tensor:
     if bits <= 0:
         raise ValueError(f"bits must be positive, got {bits}")
@@ -800,7 +820,7 @@ def gptq_mixed_quantize(state_dict, hessians, args):
         else:
             cs = args.matrix_clip_sigmas
             bits = args.matrix_bits
-        if args.hqclip_enabled:
+        if should_apply_hqclip(name, quant_cat, args):
             q, s, best_cs, _ = search_gptq_clip_sigmas(
                 t,
                 hessians[name],
@@ -1581,7 +1601,10 @@ def main() -> None:
     if args.qres_enabled and args.qres_rank > 0:
         log0(f"qres:enabled rank:{args.qres_rank} layer_start:{args.qres_layer_start} targets:{args.qres_targets}")
     if args.hqclip_enabled:
-        log0(f"hqclip:enabled spread:{args.hqclip_spread} steps:{args.hqclip_steps}")
+        log0(
+            f"hqclip:enabled spread:{args.hqclip_spread} steps:{args.hqclip_steps} "
+            f"targets:{args.hqclip_targets} layer_start:{args.hqclip_layer_start}"
+        )
     if base_model.recur_alpha is not None:
         log0(f"recur_alpha:enabled params:{base_model.recur_alpha.numel()} init:{args.recur_alpha_init}")
     if base_model.recur_ab is not None:
