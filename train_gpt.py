@@ -140,6 +140,12 @@ class Hyperparameters:
     qres_rank = int(os.environ.get("QRES_RANK", 1))
     qres_layer_start = int(os.environ.get("QRES_LAYER_START", 7))
     qres_targets = os.environ.get("QRES_TARGETS", "qk")
+    awqlite_enabled = bool(int(os.environ.get("AWQLITE_ENABLED", "0")))
+    awqlite_alpha = float(os.environ.get("AWQLITE_ALPHA", 0.5))
+    awqlite_targets = os.environ.get("AWQLITE_TARGETS", "attn")
+    awqlite_layer_start = int(os.environ.get("AWQLITE_LAYER_START", 7))
+    awqlite_group_size = int(os.environ.get("AWQLITE_GROUP_SIZE", 64))
+    awqlite_max_scale = float(os.environ.get("AWQLITE_MAX_SCALE", 4.0))
     hqclip_enabled = bool(int(os.environ.get("HQCLIP_ENABLED", "0")))
     hqclip_spread = float(os.environ.get("HQCLIP_SPREAD", 0.15))
     hqclip_steps = int(os.environ.get("HQCLIP_STEPS", 3))
@@ -613,6 +619,31 @@ def should_apply_hqclip(name, quant_cat, args):
         return "matrix" in targets
     return False
 
+def should_apply_awqlite(name, args):
+    if not args.awqlite_enabled:
+        return False
+    if args.awqlite_layer_start >= 0:
+        match = re.search(r"blocks\.(\d+)\.", name)
+        if match is None or int(match.group(1)) < args.awqlite_layer_start:
+            return False
+    targets = args.awqlite_targets
+    if "all" in targets:
+        return True
+    if ".attn." in name:
+        if "attn" in targets:
+            return True
+        if ".attn.c_q.weight" in name:
+            return "q" in targets or "qk" in targets
+        if ".attn.c_k.weight" in name:
+            return "k" in targets or "qk" in targets
+        if ".attn.c_v.weight" in name:
+            return "v" in targets
+        if ".attn.proj.weight" in name:
+            return "proj" in targets
+    if ".mlp." in name:
+        return "mlp" in targets
+    return False
+
 def fake_quantize_rowwise(weight: Tensor, bits: int, clip_sigmas: float) -> Tensor:
     if bits <= 0:
         raise ValueError(f"bits must be positive, got {bits}")
@@ -669,6 +700,8 @@ def compute_qat_lite_penalty(named_params: list[tuple[str, nn.Parameter, int]], 
 
 def collect_hessians(model, train_loader, args, device, n_calibration_batches=64):
     hessians = {}
+    act_sumsq = {}
+    act_count = {}
     hooks = []
     def make_hook(name):
         def hook_fn(module, inp, out):
@@ -677,7 +710,11 @@ def collect_hessians(model, train_loader, args, device, n_calibration_batches=64
                 x = x.reshape(-1, x.shape[-1])
             if name not in hessians:
                 hessians[name] = torch.zeros(x.shape[1], x.shape[1], dtype=torch.float32, device=device)
+                act_sumsq[name] = torch.zeros(x.shape[1], dtype=torch.float32, device=device)
+                act_count[name] = 0
             hessians[name].addmm_(x.T, x)
+            act_sumsq[name] += x.square().sum(dim=0)
+            act_count[name] += x.shape[0]
         return hook_fn
     for name, module in model.named_modules():
         if isinstance(module, CastedLinear) and module.weight.numel() > 65536:
@@ -702,9 +739,12 @@ def collect_hessians(model, train_loader, args, device, n_calibration_batches=64
             model.forward_logits(x)
     for hook in hooks:
         hook.remove()
+    act_rms = {}
     for name in hessians:
         hessians[name] = hessians[name].cpu() / n_calibration_batches
-    return hessians
+        denom = max(act_count[name], 1)
+        act_rms[name] = (act_sumsq[name] / denom).sqrt().cpu()
+    return hessians, act_rms
 
 def gptq_quantize_weight(w, H, clip_sigmas=3.0, clip_range=63, block_size=128):
     W_orig = w.float().clone()
@@ -742,6 +782,23 @@ def gptq_quantize_weight(w, H, clip_sigmas=3.0, clip_range=63, block_size=128):
         if i2 < cols:
             W_work[:, i2:] -= Err @ Hinv[i1:i2, i2:]
     return Q[:, invperm], s
+
+def build_awqlite_group_scales(act_rms, group_size, alpha, max_scale):
+    width = act_rms.numel()
+    group_size = max(1, min(group_size, width))
+    groups = []
+    for start in range(0, width, group_size):
+        groups.append(act_rms[start : start + group_size].mean())
+    group_stats = torch.stack(groups).clamp_min(1e-6)
+    scales = group_stats.pow(alpha)
+    scales = scales / scales.log().mean().exp()
+    clamp_hi = max(max_scale, 1.0)
+    clamp_lo = 1.0 / clamp_hi
+    return scales.clamp(clamp_lo, clamp_hi).to(torch.float16)
+
+def expand_awqlite_group_scales(group_scales, width, group_size):
+    expanded = group_scales.repeat_interleave(group_size)
+    return expanded[:width].float()
 
 def build_clip_candidates(base_clip_sigmas, spread, steps):
     if steps <= 1 or spread <= 0.0:
@@ -794,22 +851,28 @@ def reconstruct_quantized_tensor(name, result, meta):
         t = q.float() * float(s.item())
     if name + ".u" in result and name + ".v" in result:
         t = t + result[name + ".u"].float() @ result[name + ".v"].float()
+    if name + ".awq_scale" in result:
+        group_scales = result[name + ".awq_scale"].float()
+        group_size = int(result[name + ".awq_group_size"].item())
+        col_scales = expand_awqlite_group_scales(group_scales, t.shape[1], group_size).to(t.dtype)
+        t = t / col_scales.unsqueeze(0)
     return t
 
-def gptq_mixed_quantize(state_dict, hessians, args):
+def gptq_mixed_quantize(state_dict, hessians, act_rms, args):
     result = {}
     meta = {}
     chosen_clips = {}
     for name, tensor in state_dict.items():
-        t = tensor.detach().cpu().contiguous()
-        if not t.is_floating_point() or t.numel() <= 65536:
-            result[name] = t.to(torch.float16) if t.is_floating_point() else t
+        t_orig = tensor.detach().cpu().contiguous()
+        if not t_orig.is_floating_point() or t_orig.numel() <= 65536:
+            result[name] = t_orig.to(torch.float16) if t_orig.is_floating_point() else t_orig
             meta[name] = "passthrough (float16)"
             continue
         if name not in hessians:
-            result[name] = t.to(torch.float16)
+            result[name] = t_orig.to(torch.float16)
             meta[name] = "passthrough (missing hessian)"
             continue
+        t = t_orig
         quant_cat = classify_quant_param(name)
         if quant_cat == "embed":
             cs = args.embed_clip_sigmas
@@ -820,10 +883,23 @@ def gptq_mixed_quantize(state_dict, hessians, args):
         else:
             cs = args.matrix_clip_sigmas
             bits = args.matrix_bits
+        h_for_quant = hessians[name]
+        awq_group_scales = None
+        if should_apply_awqlite(name, args) and name in act_rms:
+            awq_group_scales = build_awqlite_group_scales(
+                act_rms[name],
+                group_size=args.awqlite_group_size,
+                alpha=args.awqlite_alpha,
+                max_scale=args.awqlite_max_scale,
+            )
+            col_scales = expand_awqlite_group_scales(awq_group_scales, t.shape[1], args.awqlite_group_size)
+            t = t * col_scales.unsqueeze(0)
+            inv_scales = (1.0 / col_scales.clamp_min(1e-6)).float()
+            h_for_quant = inv_scales[:, None] * h_for_quant.float() * inv_scales[None, :]
         if should_apply_hqclip(name, quant_cat, args):
             q, s, best_cs, _ = search_gptq_clip_sigmas(
                 t,
-                hessians[name],
+                h_for_quant,
                 base_clip_sigmas=cs,
                 clip_range=2 ** (bits - 1) - 1,
                 spread=args.hqclip_spread,
@@ -831,12 +907,15 @@ def gptq_mixed_quantize(state_dict, hessians, args):
             )
             chosen_clips[name] = best_cs
         else:
-            q, s = gptq_quantize_weight(t, hessians[name], clip_sigmas=cs, clip_range=2 ** (bits - 1) - 1)
+            q, s = gptq_quantize_weight(t, h_for_quant, clip_sigmas=cs, clip_range=2 ** (bits - 1) - 1)
         result[name + ".q"] = q
         result[name + ".scale"] = s
+        if awq_group_scales is not None:
+            result[name + ".awq_scale"] = awq_group_scales
+            result[name + ".awq_group_size"] = torch.tensor(args.awqlite_group_size, dtype=torch.int16)
         if should_apply_qres(name, args):
             deq = reconstruct_quantized_tensor(name, result, {name: f"gptq (int{bits})"})
-            u, v = low_rank_residual(t.float() - deq, args.qres_rank)
+            u, v = low_rank_residual(t_orig.float() - deq, args.qres_rank)
             if u is not None and v is not None:
                 result[name + ".u"] = u
                 result[name + ".v"] = v
@@ -1600,6 +1679,12 @@ def main() -> None:
         )
     if args.qres_enabled and args.qres_rank > 0:
         log0(f"qres:enabled rank:{args.qres_rank} layer_start:{args.qres_layer_start} targets:{args.qres_targets}")
+    if args.awqlite_enabled:
+        log0(
+            f"awqlite:enabled alpha:{args.awqlite_alpha} targets:{args.awqlite_targets} "
+            f"layer_start:{args.awqlite_layer_start} group_size:{args.awqlite_group_size} "
+            f"max_scale:{args.awqlite_max_scale}"
+        )
     if args.hqclip_enabled:
         log0(
             f"hqclip:enabled spread:{args.hqclip_spread} steps:{args.hqclip_steps} "
@@ -1856,9 +1941,9 @@ def main() -> None:
     log0("GPTQ:collecting Hessians from calibration data...")
     t_gptq = time.perf_counter()
     calib_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-    hessians = collect_hessians(base_model, calib_loader, args, device, n_calibration_batches=args.gptq_calibration_batches)
+    hessians, act_rms = collect_hessians(base_model, calib_loader, args, device, n_calibration_batches=args.gptq_calibration_batches)
     log0(f"GPTQ:collected {len(hessians)} Hessians in {time.perf_counter() - t_gptq:.1f}s")
-    quant_result, quant_meta, chosen_clips = gptq_mixed_quantize(sd_cpu, hessians, args)
+    quant_result, quant_meta, chosen_clips = gptq_mixed_quantize(sd_cpu, hessians, act_rms, args)
     quant_buf = io.BytesIO()
     torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
     quant_raw = quant_buf.getvalue()
