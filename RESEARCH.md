@@ -268,6 +268,137 @@ New implication:
 - recurrent-alpha gating is likely additive with the recurrence schedule, but only weakly so far
 - it is worth one or two narrow follow-up ablations, not a large blind tuning tree
 
+### Recurrent-alpha init tuned down: `RECUR_ALPHA_INIT=0.85`
+
+Follow-up run with a slightly weaker recurrent-alpha initialization:
+
+- `MUON_EQR=1`
+- `EMA_DECAY=0`
+- `ENABLE_LOOPING_AT=0.42`
+- `RECUR_ALPHA_ENABLED=1`
+- `RECUR_ALPHA_INIT=0.85`
+- ramped QAT-lite enabled
+
+Result:
+
+- raw pre-quant `val_bpb`: `1.1036`
+- quantized `val_bpb`: `1.1240`
+- TTT `val_bpb`: `1.09845381`
+- total size: `16067358`
+
+Interpretation:
+
+- this was effectively a wash versus the `0.42` control and worse than `RECUR_ALPHA_INIT=1.0`
+- the weaker init gave back most of the benefit from recurrent-alpha gating
+- this suggests the simpler `RECUR_ALPHA_INIT=1.0` setting is the stronger alpha-only version
+
+### Low-rank GPTQ residual correction (`QRES`) on top of `ENABLE_LOOPING_AT=0.42`
+
+Follow-up run testing a post-quant low-rank residual correction on late-layer `q/k` weights:
+
+- `QRES_ENABLED=1`
+- `QRES_RANK=1`
+- `QRES_LAYER_START=7`
+- `QRES_TARGETS=qk`
+
+Result:
+
+- raw pre-quant `val_bpb`: `1.1045`
+- quantized `val_bpb`: `1.1227`
+- TTT `val_bpb`: `1.09896577`
+- total size: `16080150`
+
+Interpretation:
+
+- this was a miss
+- it regressed the best completed branch despite adding more bytes
+- the remaining gap does not appear to be best attacked by storing low-rank post-quant residuals in this form
+
+### Recurrent alpha/beta memory blend on top of `ENABLE_LOOPING_AT=0.42`
+
+Follow-up run replacing simple recurrent-alpha gating with a learned alpha/beta blend against the cached output from the previous visit of the same repeated layer:
+
+- `MUON_EQR=1`
+- `EMA_DECAY=0`
+- `ENABLE_LOOPING_AT=0.42`
+- `RECUR_ALPHA_ENABLED=0`
+- `RECUR_AB_ENABLED=1`
+- `RECUR_A_INIT=1.0`
+- `RECUR_B_INIT=0.0`
+- ramped QAT-lite enabled
+
+Result:
+
+- raw pre-quant `val_bpb`: `1.1018`
+- quantized `val_bpb`: `1.1243`
+- TTT `val_bpb`: `1.09664494`
+- total size: `16067345`
+
+Interpretation:
+
+- this is the best completed run seen so far in this research round
+- it beats the previous best recurrent-alpha branch (`1.09808318`) by about `0.00144 BPB`
+- it beats the best plain `ENABLE_LOOPING_AT=0.42` control (`1.09845764`) by about `0.00181 BPB`
+- the gain came from a recurrence-native learned blend, not from post-quant correction tricks
+- it is still over the size cap, but this is the first recurrence-side novelty after MuonEq-R that produced another clearly meaningful jump
+
+### XSA on last 4 layers on top of the best `RECUR_AB` branch
+
+Follow-up run adding XSA as an orthogonal attention-side change on top of the current best recurrence stack:
+
+- `MUON_EQR=1`
+- `EMA_DECAY=0`
+- `ENABLE_LOOPING_AT=0.42`
+- `RECUR_ALPHA_ENABLED=0`
+- `RECUR_AB_ENABLED=1`
+- `RECUR_A_INIT=1.0`
+- `RECUR_B_INIT=0.0`
+- ramped QAT-lite enabled
+- `XSA_LAST_N=4`
+
+Result:
+
+- raw pre-quant `val_bpb`: `1.1032`
+- quantized `val_bpb`: `1.1191`
+- TTT `val_bpb`: `1.09783631`
+- total size: `16066270`
+
+Interpretation:
+
+- this did not beat the current best `RECUR_AB` run (`1.09664494`)
+- it was worse on final TTT by about `0.00119 BPB`
+- however, it improved quantized BPB materially (`1.1243 -> 1.1191`)
+- that makes XSA look like a real orthogonal signal, just not yet aligned with the best final TTT setting
+- the strongest next XSA follow-up is likely `XSA_LAST_N=3`, not `11`, because the looped architecture already reuses the core layers and `XSA-all` was previously reported as slightly harmful on repeated-loop models
+
+### XSA on last 2 layers on top of the best `RECUR_AB` branch
+
+Follow-up run narrowing XSA further:
+
+- `MUON_EQR=1`
+- `EMA_DECAY=0`
+- `ENABLE_LOOPING_AT=0.42`
+- `RECUR_ALPHA_ENABLED=0`
+- `RECUR_AB_ENABLED=1`
+- `RECUR_A_INIT=1.0`
+- `RECUR_B_INIT=0.0`
+- ramped QAT-lite enabled
+- `XSA_LAST_N=2`
+
+Result:
+
+- raw pre-quant `val_bpb`: `1.1036`
+- quantized `val_bpb`: `1.1277`
+- TTT `val_bpb`: `1.09865076`
+- total size: `16067361`
+
+Interpretation:
+
+- this was worse than both the `XSA_LAST_N=4` branch (`1.09783631`) and the no-XSA best `RECUR_AB` branch (`1.09664494`)
+- unlike `XSA_LAST_N=4`, it did not preserve a quantized-BPB advantage
+- this makes `XSA_LAST_N=2` a miss
+- if XSA is continued at all, the only remaining high-signal probe is `XSA_LAST_N=3`; otherwise the evidence now points back toward recurrence-side tuning
+
 ## Novel Technique Experiments
 
 ### 1. OSP-lite
@@ -466,6 +597,72 @@ Relevant commit:
 
 - `fbc4c08` Add Q/K activation-tail regularizer
 
+## Pass-Specific Low-Rank Recurrence Adapters
+
+Novel legal idea tested:
+
+- tiny pass-specific low-rank adapters on repeated loop visits only
+- inspired by recent weight-sharing / recursive-transformer modulation papers
+- purely training-time / artifact-time; no eval semantic changes
+
+Representative run:
+
+- raw pre-quant `val_bpb`: `1.1052`
+- quantized `val_bpb`: `1.1217`
+- TTT `val_bpb`: `1.09932544`
+- total size: `16083187`
+
+Conclusion:
+
+- this was a miss
+- it hurt raw model quality and final TTT relative to the best `RECUR_AB` branch
+- even though quantized BPB stayed decent, the overall result was clearly worse than the current best local run
+- not worth keeping in the main quality branch
+
+Relevant commits:
+
+- `38fabb9` Add pass-specific low-rank recurrence adapters
+- `f50ce9f` Fix compiled recurrence adapter scale handling
+
+## Hessian-Guided GPTQ Clip Search (HQClip)
+
+Novel legal idea tested:
+
+- keep the best `RECUR_AB` training stack fixed
+- change only post-training GPTQ by searching a small set of clip values per matrix
+- choose the clip that minimizes a Hessian-diagonal-weighted reconstruction score
+
+Representative run:
+
+- raw pre-quant `val_bpb`: `1.1036`
+- quantized `val_bpb`: `1.1160`
+- TTT `val_bpb`: `1.09509057`
+- total size: `16906236`
+
+Observed clip-search summary:
+
+- `HQClip:chosen_clips count=67 mean=11.1571 min=10.9225 max=17.0000`
+
+Interpretation:
+
+- this is the **best quality result** seen so far in this research round
+- it improves the previous best `RECUR_AB` branch (`1.09664494`) by about `0.00155 BPB`
+- the gain comes almost entirely from better post-quant / post-TTT behavior, not better raw training quality
+- however, the quantized artifact became much less compressible:
+  - quantized blob jumped to about `16.82 MB`
+  - total submission size jumped to about `16.91 MB`
+- therefore the current broad HQClip formulation is a **good signal but bad packaging**
+
+Conclusion:
+
+- Hessian-guided clip search is promising and clearly real as a quality lever
+- but it must be narrowed or targeted before it is usable under the artifact cap
+- safest next direction: restrict HQClip to the most sensitive matrix groups rather than all 67 large matrices
+
+Relevant commit:
+
+- `88578ee` Add Hessian-guided GPTQ clip search
+
 ## Paper Notes
 
 ### Useful / relevant
@@ -506,9 +703,12 @@ What seems true right now:
 8. The cleaned-up ramped QAT-lite branch was a strong stepping stone, but restoring MuonEq-R produced a much larger gain.
 9. MuonEq-R is a real breakthrough, but after the scheduling fix there is strong evidence that the depth-recurrence activation was also previously missing from effective runs.
 10. Late-start EMA still appears harmful even on the stronger MuonEq-R branch.
-11. The current best completed branch in this round is now: MuonEq-R + real wallclock-aware recurrence + no EMA + ramped QAT-lite, with `ENABLE_LOOPING_AT=0.40` and `ttt val_bpb = 1.09874205`.
+11. The strongest local quality branch is now: MuonEq-R + wallclock-aware recurrence + no EMA + ramped QAT-lite + recurrent alpha/beta memory blend + Hessian-guided GPTQ clip search, with `ttt val_bpb = 1.09509057`, though it is far over the size cap.
 12. Recurrence scheduling is now a major optimization lever because it improves quality but sharply reduces the number of training steps that fit in 600s.
-13. The branch is still over the cap, but at this point the dominant challenge is closing the remaining quality gap to the public record while eventually recovering submission legality.
+13. Recurrence-native learned blending looks more promising than post-quant residual correction for this stack, but pass-specific low-rank recurrence adapters were not helpful.
+14. XSA on the deepest layers is mixed: `XSA_LAST_N=4` improved quantized BPB significantly, but did not improve final TTT; `XSA_LAST_N=2` regressed on both quantized and final TTT.
+15. Hessian-guided clip search is the first clearly helpful post-quant novelty in this round, but its current broad form destroys compressibility and is not viable as-is.
+16. The branch is still over the cap, but at this point the dominant challenge is closing the remaining quality gap to the public record while eventually recovering submission legality.
 
 ## Recommended Next Steps
 
@@ -518,9 +718,10 @@ If continuing pretraining-side novelty:
 2. use QAT-lite as the main surviving novelty path
 3. prefer ramped/late QAT-lite over carrying extra dead regularizers in the main file
 4. only revive QACT-lite if a combined run clearly beats QAT-lite alone
-5. prioritize code-size reduction on the current best QAT-lite branch before adding more modeling novelty
-6. use the current QAT-lite branch to test selective targets (`q`, `k`, `qk`, `qk+proj`) and smarter penalties (`mse`, `clip`, `hybrid`) before inventing a new family of tricks
-7. treat MuonEq-R as part of the mainline stack, not an optional tweak
+5. treat the current `RECUR_AB` + `HQClip` branch as the main quality leader, but treat the plain `RECUR_AB` branch as the main size-aware control
+6. if continuing XSA at all, test `XSA_LAST_N=3` next and stop if it misses
+7. prefer targeted post-quant follow-ups over reviving `QRES`, `RECUR_LORA`, or broad XSA sweeps
+8. treat MuonEq-R as part of the mainline stack, not an optional tweak
 
 ## Next High-Upside Hypothesis
 
@@ -529,7 +730,7 @@ If continuing pretraining-side novelty:
 Rationale:
 
 - after the scheduling fix, recurrence actually turns on around wallclock fraction `0.35`
-- real recurrence activation produced the best final TTT seen so far, and delaying it slightly to `ENABLE_LOOPING_AT=0.40` improved that again to `1.09874205`
+- real recurrence activation produced the best final TTT seen so far, and delaying it to `ENABLE_LOOPING_AT=0.42` plus adding recurrent alpha/beta blending improved that further to `1.09664494`
 - however, it also reduced total training from about `4860` steps to about `3886` steps
 - this tradeoff suggests the start fraction itself may now be suboptimal
 
@@ -543,14 +744,14 @@ Idea:
 - keep `MUON_EQR=1`
 - keep wallclock-aware recurrence activation
 - set `EMA_DECAY=0`
-- test both:
-  - recurrence + no QAT
-  - recurrence + ramped QAT-lite
-- then, if QAT-lite remains helpful, sweep the recurrence activation point around the new best:
-  - `enable_looping_at=0.38`
-  - `enable_looping_at=0.42`
-  - `enable_looping_at=0.45`
-- compare them against the current best `enable_looping_at=0.40` branch
+- use the current `ENABLE_LOOPING_AT=0.42` + `RECUR_AB` branch as the control
+- test recurrence-native follow-ups before introducing tokenizer or eval-risk ideas:
+  - small negative `RECUR_B_INIT`
+  - slightly sub-unit `RECUR_A_INIT`
+  - narrow recurrence-start sweep around `0.42`
+- test narrow XSA follow-ups on top of that control:
+  - `XSA_LAST_N=3`
+- compare them against the current best `1.09664494` branch
 
 If optimizing for highest practical win probability instead:
 
