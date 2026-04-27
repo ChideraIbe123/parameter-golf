@@ -100,6 +100,9 @@ class Hyperparameters:
     recur_ab_enabled = bool(int(os.environ.get("RECUR_AB_ENABLED", "0")))
     recur_a_init = float(os.environ.get("RECUR_A_INIT", 1.0))
     recur_b_init = float(os.environ.get("RECUR_B_INIT", 0.0))
+    recur_lora_enabled = bool(int(os.environ.get("RECUR_LORA_ENABLED", "0")))
+    recur_lora_rank = int(os.environ.get("RECUR_LORA_RANK", 1))
+    recur_lora_alpha = float(os.environ.get("RECUR_LORA_ALPHA", 1.0))
 
     # Parallel residuals (PR #1412/#1493).
     parallel_residual_start = int(os.environ.get("PARALLEL_RESIDUAL_START", 7))
@@ -1085,6 +1088,23 @@ class MLP(nn.Module):
         return self.proj(F.leaky_relu(self.fc(x), negative_slope=0.5).square())
 
 
+class RecurLowRank(nn.Module):
+    # Tiny pass-specific low-rank adapter for repeated loop visits.
+    def __init__(self, dim: int, rank: int, alpha: float):
+        super().__init__()
+        self.scale = alpha / max(rank, 1)
+        self.down = CastedLinear(dim, rank, bias=False)
+        self.up = CastedLinear(rank, dim, bias=False)
+        self.up._zero_init = True
+
+    def graph_anchor(self, dtype: torch.dtype) -> Tensor:
+        return self.down.weight.to(dtype).sum() + self.up.weight.to(dtype).sum()
+
+    def forward(self, x: Tensor) -> Tensor:
+        h = F.rms_norm(x, (x.size(-1),))
+        return x + self.up(self.down(h)) * self.scale
+
+
 class Block(nn.Module):
     def __init__(
         self,
@@ -1178,6 +1198,7 @@ class GPT(nn.Module):
         self.looping_active = False
         self.recur_alpha = None
         self.recur_ab = None
+        self.recur_lora = None
         self.encoder_recur_alpha: list[int] = []
         self.decoder_recur_alpha: list[int] = []
         if h.num_loops > 0:
@@ -1189,7 +1210,7 @@ class GPT(nn.Module):
             num_enc = len(all_indices) // 2
             self.encoder_indices = all_indices[:num_enc]
             self.decoder_indices = all_indices[num_enc:]
-            if h.recur_alpha_enabled or h.recur_ab_enabled:
+            if h.recur_alpha_enabled or h.recur_ab_enabled or h.recur_lora_enabled:
                 counts: dict[int, int] = collections.defaultdict(int)
                 recur_alpha_map: list[int] = []
                 recur_alpha_count = 0
@@ -1209,6 +1230,10 @@ class GPT(nn.Module):
                         recur_ab[:, 0].fill_(h.recur_a_init)
                         recur_ab[:, 1].fill_(h.recur_b_init)
                         self.recur_ab = nn.Parameter(recur_ab)
+                    if h.recur_lora_enabled and h.recur_lora_rank > 0:
+                        self.recur_lora = nn.ModuleList(
+                            [RecurLowRank(h.model_dim, h.recur_lora_rank, h.recur_lora_alpha) for _ in range(recur_alpha_count)]
+                        )
                 self.encoder_recur_alpha = recur_alpha_map[:num_enc]
                 self.decoder_recur_alpha = recur_alpha_map[num_enc:]
         else:
@@ -1238,6 +1263,11 @@ class GPT(nn.Module):
             x = x + self.recur_alpha.to(dtype=x.dtype).sum() * 0.0
         if self.recur_ab is not None and not self.looping_active:
             x = x + self.recur_ab.to(dtype=x.dtype).sum() * 0.0
+        if self.recur_lora is not None and not self.looping_active:
+            anchor = torch.zeros((), device=x.device, dtype=x.dtype)
+            for adapter in self.recur_lora:
+                anchor = anchor + adapter.graph_anchor(x.dtype)
+            x = x + anchor * 0.0
         x0 = x
         skips: list[Tensor] = []
         loop_cache: dict[int, Tensor] = {}
@@ -1259,6 +1289,11 @@ class GPT(nn.Module):
             ab = self.recur_ab[alpha_idx].to(dtype=x_out.dtype)
             return ab[0] * x_out + ab[1] * cached
 
+        def apply_recur_lora(x_out: Tensor, alpha_idx: int) -> Tensor:
+            if self.recur_lora is None or alpha_idx < 0:
+                return x_out
+            return self.recur_lora[alpha_idx](x_out)
+
         enc_iter = self.encoder_indices if self.looping_active else range(self.num_encoder_layers)
         dec_iter = self.decoder_indices if self.looping_active else range(self.num_encoder_layers, self.num_encoder_layers + self.num_decoder_layers)
 
@@ -1270,6 +1305,7 @@ class GPT(nn.Module):
                 x = apply_recur_ab(i, x, recur_idx)
             else:
                 x = apply_recur_alpha(x_in, x, recur_idx)
+            x = apply_recur_lora(x, recur_idx)
             loop_cache[i] = x
             skips.append(x)
         for skip_idx, i in enumerate(dec_iter):
@@ -1287,6 +1323,7 @@ class GPT(nn.Module):
                 x = apply_recur_ab(i, x, recur_idx)
             else:
                 x = apply_recur_alpha(x_in, x, recur_idx)
+            x = apply_recur_lora(x, recur_idx)
             loop_cache[i] = x
 
         x = self.final_norm(x)
@@ -1432,6 +1469,18 @@ def main() -> None:
         scalar_params.append(base_model.recur_alpha)
     if base_model.recur_ab is not None:
         scalar_params.append(base_model.recur_ab)
+    if base_model.recur_lora is not None:
+        recur_lora_named_params = list(base_model.recur_lora.named_parameters())
+        matrix_params.extend(
+            p
+            for name, p in recur_lora_named_params
+            if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        )
+        scalar_params.extend(
+            p
+            for name, p in recur_lora_named_params
+            if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        )
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.AdamW(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1496,6 +1545,9 @@ def main() -> None:
         log0(f"recur_alpha:enabled params:{base_model.recur_alpha.numel()} init:{args.recur_alpha_init}")
     if base_model.recur_ab is not None:
         log0(f"recur_ab:enabled params:{base_model.recur_ab.numel()} init_a:{args.recur_a_init} init_b:{args.recur_b_init}")
+    if base_model.recur_lora is not None:
+        recur_lora_params = sum(p.numel() for p in base_model.recur_lora.parameters())
+        log0(f"recur_lora:enabled params:{recur_lora_params} rank:{args.recur_lora_rank} alpha:{args.recur_lora_alpha}")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
