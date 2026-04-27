@@ -140,6 +140,9 @@ class Hyperparameters:
     qres_rank = int(os.environ.get("QRES_RANK", 1))
     qres_layer_start = int(os.environ.get("QRES_LAYER_START", 7))
     qres_targets = os.environ.get("QRES_TARGETS", "qk")
+    hqclip_enabled = bool(int(os.environ.get("HQCLIP_ENABLED", "0")))
+    hqclip_spread = float(os.environ.get("HQCLIP_SPREAD", 0.15))
+    hqclip_steps = int(os.environ.get("HQCLIP_STEPS", 3))
 
     # EMA.
     ema_decay = float(os.environ.get("EMA_DECAY", "0.0"))
@@ -720,6 +723,34 @@ def gptq_quantize_weight(w, H, clip_sigmas=3.0, clip_range=63, block_size=128):
             W_work[:, i2:] -= Err @ Hinv[i1:i2, i2:]
     return Q[:, invperm], s
 
+def build_clip_candidates(base_clip_sigmas, spread, steps):
+    if steps <= 1 or spread <= 0.0:
+        return [base_clip_sigmas]
+    if steps % 2 == 0:
+        steps += 1
+    lo = base_clip_sigmas * (1.0 - spread)
+    hi = base_clip_sigmas * (1.0 + spread)
+    return [lo + (hi - lo) * i / (steps - 1) for i in range(steps)]
+
+def hessian_diag_error_score(w, q, s, h_diag):
+    deq = q.float() * s.float().view(q.shape[0], *[1] * (q.ndim - 1))
+    err = w.float() - deq
+    return float((err.square() * h_diag.unsqueeze(0)).sum().item() / max(err.numel(), 1))
+
+def search_gptq_clip_sigmas(w, H, base_clip_sigmas, clip_range, spread, steps):
+    h_diag = H.diag().float().clamp_min(1e-8)
+    best = None
+    best_score = None
+    best_clip = base_clip_sigmas
+    for clip_sigmas in build_clip_candidates(base_clip_sigmas, spread, steps):
+        q, s = gptq_quantize_weight(w, H, clip_sigmas=clip_sigmas, clip_range=clip_range)
+        score = hessian_diag_error_score(w, q, s, h_diag)
+        if best_score is None or score < best_score:
+            best = (q, s)
+            best_score = score
+            best_clip = clip_sigmas
+    return best[0], best[1], best_clip, float(best_score)
+
 def low_rank_residual(residual, rank):
     rank = min(rank, min(residual.shape))
     if rank <= 0:
@@ -748,6 +779,7 @@ def reconstruct_quantized_tensor(name, result, meta):
 def gptq_mixed_quantize(state_dict, hessians, args):
     result = {}
     meta = {}
+    chosen_clips = {}
     for name, tensor in state_dict.items():
         t = tensor.detach().cpu().contiguous()
         if not t.is_floating_point() or t.numel() <= 65536:
@@ -768,7 +800,18 @@ def gptq_mixed_quantize(state_dict, hessians, args):
         else:
             cs = args.matrix_clip_sigmas
             bits = args.matrix_bits
-        q, s = gptq_quantize_weight(t, hessians[name], clip_sigmas=cs, clip_range=2 ** (bits - 1) - 1)
+        if args.hqclip_enabled:
+            q, s, best_cs, _ = search_gptq_clip_sigmas(
+                t,
+                hessians[name],
+                base_clip_sigmas=cs,
+                clip_range=2 ** (bits - 1) - 1,
+                spread=args.hqclip_spread,
+                steps=args.hqclip_steps,
+            )
+            chosen_clips[name] = best_cs
+        else:
+            q, s = gptq_quantize_weight(t, hessians[name], clip_sigmas=cs, clip_range=2 ** (bits - 1) - 1)
         result[name + ".q"] = q
         result[name + ".scale"] = s
         if should_apply_qres(name, args):
@@ -780,11 +823,7 @@ def gptq_mixed_quantize(state_dict, hessians, args):
                 meta[name] = f"gptq+qres (int{bits}+r{u.shape[1]})"
                 continue
         meta[name] = f"gptq (int{bits})"
-    categories = collections.defaultdict(set)
-    for name, cat in meta.items():
-        short = re.sub(r"\.\d+$", "", re.sub(r"blocks\.\d+", "blocks", name))
-        categories[cat].add(short)
-    return result, meta
+    return result, meta, chosen_clips
 
 def dequantize_mixed(result, meta, template_sd):
     out = {}
@@ -1541,6 +1580,8 @@ def main() -> None:
         )
     if args.qres_enabled and args.qres_rank > 0:
         log0(f"qres:enabled rank:{args.qres_rank} layer_start:{args.qres_layer_start} targets:{args.qres_targets}")
+    if args.hqclip_enabled:
+        log0(f"hqclip:enabled spread:{args.hqclip_spread} steps:{args.hqclip_steps}")
     if base_model.recur_alpha is not None:
         log0(f"recur_alpha:enabled params:{base_model.recur_alpha.numel()} init:{args.recur_alpha_init}")
     if base_model.recur_ab is not None:
@@ -1794,7 +1835,7 @@ def main() -> None:
     calib_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
     hessians = collect_hessians(base_model, calib_loader, args, device, n_calibration_batches=args.gptq_calibration_batches)
     log0(f"GPTQ:collected {len(hessians)} Hessians in {time.perf_counter() - t_gptq:.1f}s")
-    quant_result, quant_meta = gptq_mixed_quantize(sd_cpu, hessians, args)
+    quant_result, quant_meta, chosen_clips = gptq_mixed_quantize(sd_cpu, hessians, args)
     quant_buf = io.BytesIO()
     torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
     quant_raw = quant_buf.getvalue()
@@ -1814,6 +1855,12 @@ def main() -> None:
     if quant_error_per_layer:
         mean_err = sum(quant_error_per_layer.values()) / len(quant_error_per_layer)
         log0(f"GPTQ:per-layer quant error: mean={mean_err:.6f} max={max(quant_error_per_layer.values()):.6f} min={min(quant_error_per_layer.values()):.6f}")
+    if args.hqclip_enabled and chosen_clips:
+        mean_clip = sum(chosen_clips.values()) / len(chosen_clips)
+        log0(
+            f"HQClip:chosen_clips count={len(chosen_clips)} "
+            f"mean={mean_clip:.4f} min={min(chosen_clips.values()):.4f} max={max(chosen_clips.values()):.4f}"
+        )
 
     if master_process:
         with open("final_model.gptq.ptz", "wb") as f:
